@@ -1,11 +1,12 @@
 // api/ai-analyze.js
-// ✅ OpenAI版（Gemini置換） + CORS対応
+// ✅ OpenAI版（Gemini置換） + CORS対応（WPから確実に叩ける）
 // POST /api/ai-analyze
 // body: { result: CalculationResult }
 //
 // env:
 //   OPENAI_API_KEY=xxxx
 //   ALLOWED_ORIGINS=https://spikatsu.anjyanen.com,https://www.spikatsu.anjyanen.com
+//   OPENAI_MODEL=gpt-4.1-mini (任意)
 
 import OpenAI from "openai";
 import { applyCors } from "../lib/cors.js";
@@ -15,7 +16,9 @@ export default async function handler(req, res) {
   if (cors.ended) return;
 
   try {
-    if (req.method !== "POST") return res.status(405).json({ ok: false, error: "POST only" });
+    if (req.method !== "POST") {
+      return res.status(405).json({ ok: false, error: "POST only" });
+    }
 
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
     const result = body?.result;
@@ -29,10 +32,12 @@ export default async function handler(req, res) {
     }
 
     const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const model = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 
     const p = result.pillars;
     const d = result.derived || {};
     const luck = d.luck || {};
+
     const sexLabel =
       result.input?.sex === "M" ? "男性" :
       result.input?.sex === "F" ? "女性" : "未選択";
@@ -47,9 +52,10 @@ export default async function handler(req, res) {
         ? luck.dayun[luck.current.currentDayunIndex]
         : null;
 
+    // 命式の“確定値”をできるだけ構造化して渡す（AIのぶれを減らす）
     const payloadForLLM = {
       input: result.input,
-      meta: result.meta,
+      meta: result.meta || null,
       pillars: {
         year:  { kan: p.year.kan,  shi: p.year.shi,  zokan: p.year.zokan,  rule: p.year.rule },
         month: { kan: p.month.kan, shi: p.month.shi, zokan: p.month.zokan, rule: p.month.rule },
@@ -80,8 +86,8 @@ export default async function handler(req, res) {
             ageTo: currentDayun.ageTo,
             relationsToNatal: currentDayun.relationsToNatal || null,
           } : null,
-        }
-      }
+        },
+      },
     };
 
     const system = `
@@ -91,6 +97,7 @@ export default async function handler(req, res) {
 - 専門性：日干・月令・蔵干・通変星（十神）・五行・年運/大運の現在テーマを重視。
 - 出力形式：Markdown。見出しと箇条書きを使い、読みやすく。
 - 禁止：内部実装語（JDN、index60、MVP、Mock、計算式）を本文に出さない。
+- 禁止：入力JSONにない「今年」「2024年」「来年」など特定年の断定。年運・大運が currentNenun/currentDayun で与えられた場合のみ言及する。
 `.trim();
 
     const user = `
@@ -106,17 +113,16 @@ ${JSON.stringify(payloadForLLM, null, 2)}
 4. 恋愛/対人（※必要なら。決めつけ禁止）
 5. いまの運気テーマ（年運/大運の“現在”があれば最優先で言語化）
 6. 開運アクション（今日/今週できる具体策を3つ）
+
+※注意：JSONに currentNenun/currentDayun が null の場合、「今年は〜」など特定年の運勢断定は禁止。代わりに「一般的に出やすいテーマ」として述べること。
 ※時柱が null の場合は「出生時間不明」と明記し、時柱依存の断定を避けてください。
 `.trim();
-
-    // ✅ まずは確実に動くモデルをデフォルトに（後で上げられる）
-    const model = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 
     const response = await client.responses.create({
       model,
       input: [
         { role: "system", content: system },
-        { role: "user", content: user }
+        { role: "user", content: user },
       ],
       temperature: 0.7,
     });
