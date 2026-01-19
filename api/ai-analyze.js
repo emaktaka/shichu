@@ -1,24 +1,31 @@
 // api/ai-analyze.js
-// ✅ OpenAI版（Gemini置換）
+// ✅ OpenAI版（Gemini置換） + CORS制限
 // POST /api/ai-analyze
-// body: {
-//   result: CalculationResult（= /api/shichusuimei のレスポンス）
-// }
+// body: { result: CalculationResult (= /api/shichusuimei のレスポンス丸ごと) }
 //
 // env:
-//   OPENAI_API_KEY=xxxxxxxx
+//   OPENAI_API_KEY=xxxxx
+//   ALLOWED_ORIGINS=https://spikatsu.anjyanen.com,https://www.spikatsu.anjyanen.com
 
 import OpenAI from "openai";
+import { applyCors } from "../lib/cors.js";
 
 export default async function handler(req, res) {
+  const cors = applyCors(req, res);
+  if (cors.ended) return;
+
   try {
-    if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
+    if (req.method !== "POST") return res.status(405).json({ ok: false, error: "POST only" });
 
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
     const result = body?.result;
 
     if (!result?.ok || !result?.pillars?.day?.kan) {
-      return res.status(400).json({ error: "invalid result payload" });
+      return res.status(400).json({ ok: false, error: "invalid result payload" });
+    }
+
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(500).json({ ok: false, error: "OPENAI_API_KEY is not set" });
     }
 
     const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -26,16 +33,6 @@ export default async function handler(req, res) {
     const p = result.pillars;
     const d = result.derived || {};
     const luck = d.luck || {};
-
-    const sexLabel =
-      result.input?.sex === "M" ? "男性" :
-      result.input?.sex === "F" ? "女性" : "未選択";
-
-    const fmtZokan = (z) => Array.isArray(z) ? z.join("・") : "";
-    const fmtZokanDeity = (arr) =>
-      Array.isArray(arr) ? arr.map(x => `${x.stem}:${x.deity}`).join(" / ") : "";
-
-    const five = d.fiveElements?.counts || null;
 
     const currentNenun =
       (luck?.nenun && luck?.current?.currentNenunIndex >= 0)
@@ -47,31 +44,28 @@ export default async function handler(req, res) {
         ? luck.dayun[luck.current.currentDayunIndex]
         : null;
 
-    // 命式の“確定値”をできるだけ構造化して渡す（AIのぶれを減らす）
+    // ぶれを減らすため“確定値”をJSONで渡す
     const payloadForLLM = {
       input: result.input,
       meta: result.meta,
       pillars: {
         year: { kan: p.year.kan, shi: p.year.shi, zokan: p.year.zokan, rule: p.year.rule },
-        month:{ kan: p.month.kan,shi: p.month.shi,zokan: p.month.zokan,rule: p.month.rule },
-        day:  { kan: p.day.kan,  shi: p.day.shi,  zokan: p.day.zokan,  rule: p.day.rule },
-        hour: p.hour ? { kan: p.hour.kan, shi: p.hour.shi, zokan: p.hour.zokan, rule: p.hour.rule } : null,
+        month: { kan: p.month.kan, shi: p.month.shi, zokan: p.month.zokan, rule: p.month.rule },
+        day: { kan: p.day.kan, shi: p.day.shi, zokan: p.day.zokan, rule: p.day.rule },
+        hour: p.hour ? { kan: p.hour.kan, shi: p.hour.shi, zokan: p.hour.zokan, rule: p.hour.rule } : null
       },
       derived: {
         tenDeity: d.tenDeity || null,
         zokanTenDeity: d.zokanTenDeity || null,
         fiveElements: d.fiveElements || null,
         luck: {
-          direction: luck.direction || null,
-          startCalcMode: luck.startCalcMode || null,
-          startAgeYears: luck.startAgeYears ?? null,
           current: luck.current || null,
           currentNenun: currentNenun ? {
             pillarYear: currentNenun.pillarYear,
             kan: currentNenun.kan,
             shi: currentNenun.shi,
             tenDeity: currentNenun.tenDeity,
-            relationsToNatal: currentNenun.relationsToNatal || null,
+            relationsToNatal: currentNenun.relationsToNatal || null
           } : null,
           currentDayun: currentDayun ? {
             kan: currentDayun.kan,
@@ -79,8 +73,8 @@ export default async function handler(req, res) {
             tenDeity: currentDayun.tenDeity,
             ageFrom: currentDayun.ageFrom,
             ageTo: currentDayun.ageTo,
-            relationsToNatal: currentDayun.relationsToNatal || null,
-          } : null,
+            relationsToNatal: currentDayun.relationsToNatal || null
+          } : null
         }
       }
     };
@@ -94,7 +88,6 @@ export default async function handler(req, res) {
 - 禁止：内部実装語（例: JDN、index60、MVP、Mock、計算式）を本文に出さない。
 `.trim();
 
-    // 重要：LLMに“生データ”を先に渡してから指示（ぶれが減る）
     const user = `
 以下は鑑定に必要な確定データです（JSON）。このデータのみを根拠に鑑定してください。
 \`\`\`json
@@ -112,23 +105,22 @@ ${JSON.stringify(payloadForLLM, null, 2)}
 ※時柱が null の場合は「出生時間不明」と明記し、時柱依存の断定を避けてください。
 `.trim();
 
-    // Responses API（OpenAI推奨の新しい基本API）:contentReference[oaicite:1]{index=1}
     const response = await client.responses.create({
-      model: "gpt-5.2", // まずはこれでOK（必要なら軽量モデルへ変更可能）
+      model: "gpt-5.2",
       input: [
         { role: "system", content: system },
         { role: "user", content: user }
       ],
-      temperature: 0.7,
+      temperature: 0.7
     });
 
     return res.status(200).json({
       ok: true,
       text: response.output_text || "",
-      model: response.model || "unknown",
+      model: response.model || "unknown"
     });
   } catch (e) {
     console.error(e);
-    return res.status(500).json({ error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 }
