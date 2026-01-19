@@ -1,14 +1,17 @@
 // api/shichusuimei.js
-// Phase A: 「節入り（24節気）」の境界で月柱（＋年柱の立春境界）を確定する
-//
+// Phase A+B+C 統合版（完全コピペ）
+// A: 「節入り（24節気→12節）」境界で月柱、立春境界で年柱
+// B: 平均太陽時（経度差補正）を時柱＆日柱境界に反映（都道府県→代表経度）
+// C: 日柱境界を 23:00 or 24:00 で切替（dayBoundaryMode）
+
 // POST /api/shichusuimei
 // body: {
 //   date: "YYYY-MM-DD",
 //   time: "HH:MM" | "",
 //   sex: "M"|"F"|"",
 //   birthPlace: {country:"JP", pref:"東京都"} | null,
-//   timeMode: "standard"|"mean_solar",     // Phase Bで精密化
-//   dayBoundaryMode: "23"|"24"             // Phase Cで精密化
+//   timeMode: "standard"|"mean_solar",
+//   dayBoundaryMode: "23"|"24"
 // }
 //
 // env:
@@ -24,7 +27,100 @@ const BRANCHES = ["子","丑","寅","卯","辰","巳","午","未","申","酉","�
 // 月支（寅から順）
 const MONTH_BRANCHES = ["寅","卯","辰","巳","午","未","申","酉","戌","亥","子","丑"];
 
-// 年干→寅月の干（五虎遁）
+// ---- Phase B: 都道府県→代表経度（最小実装として県庁所在地付近） ----
+// ※ 必要なら後で「市区町村」や「海外」対応へ拡張
+const PREF_LONGITUDE = {
+  "北海道": 141.35,
+  "青森県": 140.74,
+  "岩手県": 141.15,
+  "宮城県": 140.87,
+  "秋田県": 140.10,
+  "山形県": 140.34,
+  "福島県": 140.47,
+
+  "茨城県": 140.45,
+  "栃木県": 139.88,
+  "群馬県": 139.06,
+  "埼玉県": 139.65,
+  "千葉県": 140.12,
+  "東京都": 139.69,
+  "神奈川県": 139.64,
+
+  "新潟県": 139.02,
+  "富山県": 137.21,
+  "石川県": 136.66,
+  "福井県": 136.22,
+  "山梨県": 138.57,
+  "長野県": 138.18,
+
+  "岐阜県": 136.76,
+  "静岡県": 138.38,
+  "愛知県": 136.91,
+  "三重県": 136.51,
+
+  "滋賀県": 135.87,
+  "京都府": 135.76,
+  "大阪府": 135.50,
+  "兵庫県": 135.18,
+  "奈良県": 135.83,
+  "和歌山県": 135.17,
+
+  "鳥取県": 134.24,
+  "島根県": 133.05,
+  "岡山県": 133.93,
+  "広島県": 132.46,
+  "山口県": 131.47,
+
+  "徳島県": 134.56,
+  "香川県": 134.05,
+  "愛媛県": 132.77,
+  "高知県": 133.53,
+
+  "福岡県": 130.40,
+  "佐賀県": 130.30,
+  "長崎県": 129.87,
+  "熊本県": 130.71,
+  "大分県": 131.61,
+  "宮崎県": 131.42,
+  "鹿児島県": 130.56,
+
+  "沖縄県": 127.68
+};
+
+// 明石標準時（日本標準時の基準経度）
+const JST_STANDARD_MERIDIAN = 135.0;
+
+// 経度差補正（分）: (lon - 135) * 4
+function longitudeCorrectionMinutes(longitude) {
+  if (typeof longitude !== "number" || !Number.isFinite(longitude)) return 0;
+  return (longitude - JST_STANDARD_MERIDIAN) * 4;
+}
+
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+function fmtHHMM(h, m) {
+  return `${pad2(h)}:${pad2(m)}`;
+}
+
+function addMinutesToJstDateParts(Y, M, D, hh, mm, addMin) {
+  // JSTの(Y,M,D,hh,mm)に分加算して、繰り上がりを正しく扱う
+  // いったん UTC Date にして処理（JST = UTC+9なので、UTCに変換して加算）
+  const utc = new Date(Date.UTC(Y, M - 1, D, hh - 9, mm, 0));
+  const utc2 = new Date(utc.getTime() + addMin * 60 * 1000);
+  const jst2 = new Date(utc2.getTime() + 9 * 60 * 60 * 1000);
+
+  const y2 = jst2.getUTCFullYear();
+  const mo2 = jst2.getUTCMonth() + 1;
+  const d2 = jst2.getUTCDate();
+  const h2 = jst2.getUTCHours();
+  const mi2 = jst2.getUTCMinutes();
+
+  return { Y: y2, M: mo2, D: d2, hh: h2, mm: mi2, utc: utc2 };
+}
+
+// ---- 年干→寅月の干（五虎遁） ----
 function tigerMonthStemForYearStem(yearStem) {
   // 甲己年: 丙寅
   // 乙庚年: 戊寅
@@ -38,38 +134,21 @@ function tigerMonthStemForYearStem(yearStem) {
   return "甲"; // 戊 or 癸
 }
 
-function sexagenaryIndexFromStemBranch(stem, branch) {
-  const s = STEMS.indexOf(stem);
-  const b = BRANCHES.indexOf(branch);
-  if (s < 0 || b < 0) return -1;
-  // brute match
-  for (let i = 0; i < 60; i++) {
-    if (STEMS[i % 10] === stem && BRANCHES[i % 12] === branch) return i;
-  }
-  return -1;
-}
-
 function addStem(stem, add) {
   const i = STEMS.indexOf(stem);
   return STEMS[(i + add + 10) % 10];
 }
 
-// ---- 簡易：年柱の干支（立春境界） ----
-// ここは Phase A なので “年柱=立春で切替” だけをまず正しく。
-// 干支自体は「立春を含む太陽年」ベースで、(year-4) を基準に算出する古典式。
+// ---- Phase A: 年柱（立春境界） ----
 function calcYearPillarByRisshun(yearNumber) {
-  // 1984年が甲子年（干支サイクル基準）として扱う
+  // 1984年が甲子年として扱う簡易方式
   const idx = (yearNumber - 1984) % 60;
   const i = (idx + 60) % 60;
   return { kan: STEMS[i % 10], shi: BRANCHES[i % 12] };
 }
 
-// ---- 日柱/時柱はPhase Aでは“簡易”に実装（後でCで境界精密化） ----
-// ※すでにあなたのプロジェクトは「stub」だったので、まずは“動く”日柱/時柱を用意。
-//   精密な23/24切替はPhase Cで差し替える。
+// ---- 日柱（簡易） ----
 function toJdnAtUtcMidnight(y, m, d) {
-  // Gregorian to JDN at 00:00 UTC
-  // https://quasar.as.utexas.edu/BillInfo/JulianDatesG.html (standard algorithm)
   const a = Math.floor((14 - m) / 12);
   const y2 = y + 4800 - a;
   const m2 = m + 12 * a - 3;
@@ -93,12 +172,12 @@ function calcDayPillarSimple(y, m, d) {
   return { kan: STEMS[idx % 10], shi: BRANCHES[idx % 12] };
 }
 
+// ---- 時柱（簡易） ----
 function hourBranchFromTime(hh, mm) {
   // 子:23-01, 丑:01-03 ... 亥:21-23
   const minutes = hh * 60 + mm;
-  // 23:00-23:59 -> 子
   if (minutes >= 23 * 60) return "子";
-  const slot = Math.floor((minutes + 60) / 120); // shift so 00:00-00:59 -> 子 slot 0
+  const slot = Math.floor((minutes + 60) / 120); // 00:00-00:59 -> 子
   return BRANCHES[slot % 12];
 }
 
@@ -109,48 +188,37 @@ function hourStemFromDayStemAndHourBranch(dayStem, hourBranch) {
   else if (dayStem === "乙" || dayStem === "庚") ziStem = "丙";
   else if (dayStem === "丙" || dayStem === "辛") ziStem = "戊";
   else if (dayStem === "丁" || dayStem === "壬") ziStem = "庚";
-  else ziStem = "壬"; // 戊 or 癸
+  else ziStem = "壬";
 
   const ziIndex = STEMS.indexOf(ziStem);
   const hbIndex = BRANCHES.indexOf(hourBranch);
-  // 子を0として枝の順で+1ずつ
-  const stem = STEMS[(ziIndex + hbIndex) % 10];
-  return stem;
+  return STEMS[(ziIndex + hbIndex) % 10];
 }
 
-// ---- 月柱：節入り（12節）で境界を切る（Phase Aの本体） ----
+// ---- Phase A: 月柱（12節） ----
 function calcMonthPillarByJie(dateUtcForJst, yearPillarStem) {
-  // dateUtcForJst: 入力のJST日時をUTC Dateで表したもの（= JST時刻の-9h）
-  // "節"の境界は年をまたぐので、対象年と前後年のjieを作って結合して判定
   const yJst = new Date(dateUtcForJst.getTime() + 9 * 3600 * 1000).getUTCFullYear();
 
   const jiePrev = buildJie12Utc(yJst - 1);
   const jieThis = buildJie12Utc(yJst);
   const jieNext = buildJie12Utc(yJst + 1);
 
-  const all = [...jiePrev, ...jieThis, ...jieNext].sort((a, b) => a.timeUtc.getTime() - b.timeUtc.getTime());
+  const all = [...jiePrev, ...jieThis, ...jieNext].sort(
+    (a, b) => a.timeUtc.getTime() - b.timeUtc.getTime()
+  );
 
-  // find the latest jie <= dateUtcForJst
   let latest = null;
   for (const j of all) {
     if (j.timeUtc.getTime() <= dateUtcForJst.getTime()) latest = j;
     else break;
   }
-  if (!latest) {
-    // should not happen, but fallback
-    latest = all[0];
-  }
+  if (!latest) latest = all[0];
 
-  // Determine month index based on jie order starting at 立春 = 寅月
-  // We create a "cycle" list that starts from the latest 立春 before date.
-  // Simpler: compute monthIndex by mapping angle sequence:
-  const angleOrder = [315,345,15,45,75,105,135,165,195,225,255,285]; // same as lib
+  const angleOrder = [315,345,15,45,75,105,135,165,195,225,255,285];
   const idx = angleOrder.indexOf(latest.angle);
   const monthIndex = idx >= 0 ? idx : 0;
 
   const monthBranch = MONTH_BRANCHES[monthIndex];
-
-  // month stem: start from 寅月 stem derived from year stem, then +monthIndex
   const firstStem = tigerMonthStemForYearStem(yearPillarStem);
   const monthStem = addStem(firstStem, monthIndex);
 
@@ -163,17 +231,13 @@ function calcMonthPillarByJie(dateUtcForJst, yearPillarStem) {
 
 // ---- 入力処理 ----
 function parseDateTimeJstToUtc(dateStr, timeStr) {
-  // dateStr: YYYY-MM-DD, timeStr: HH:MM or ""
   const [Y, M, D] = dateStr.split("-").map((v) => parseInt(v, 10));
-  let hh = 12, mm = 0; // default noon if time missing
+  let hh = 12, mm = 0;
   if (timeStr && timeStr.includes(":")) {
     [hh, mm] = timeStr.split(":").map((v) => parseInt(v, 10));
   } else {
     hh = 12; mm = 0;
   }
-
-  // Construct JST time then convert to UTC Date:
-  // UTC = JST - 9h
   const utc = new Date(Date.UTC(Y, M - 1, D, hh - 9, mm, 0));
   return { Y, M, D, hh, mm, utc };
 }
@@ -193,42 +257,99 @@ export default async function handler(req, res) {
     const sex = body?.sex ?? "";
     const birthPlace = body?.birthPlace ?? null;
     const timeMode = body?.timeMode ?? "standard";
-    const dayBoundaryMode = body?.dayBoundaryMode ?? "24";
+    const dayBoundaryMode = String(body?.dayBoundaryMode ?? "24"); // "23"|"24"
 
     if (!date || typeof date !== "string") {
       return res.status(400).json({ ok: false, error: "date required (YYYY-MM-DD)" });
     }
 
-    const { Y, M, D, hh, mm, utc } = parseDateTimeJstToUtc(date, time);
+    const parsed = parseDateTimeJstToUtc(date, time);
+    const { Y, M, D } = parsed;
 
-    // ---- Phase A: 立春で年替わり & 節で月替わり ----
-    // 立春時刻を求め、入力が立春より前なら「年柱は前年」
-    // 立春は Jie(315°) に含まれる。year=Yのjieにある立春時刻を使う。
+    // -----------------------------
+    // Phase A: 年柱（立春）・月柱（12節）
+    // ※ここは「実時刻(JST)」基準のまま（UTCで比較）
+    // -----------------------------
+    const utcStandard = parsed.utc;
+
     const jieThis = buildJie12Utc(Y);
     const risshun = jieThis.find(j => j.angle === 315) || null;
 
-    // 判定用（JST基準）：入力 utc と risshun.utc 比較でOK（どちらもUTC）
     let yearForPillar = Y;
-    if (risshun && utc.getTime() < risshun.timeUtc.getTime()) {
+    if (risshun && utcStandard.getTime() < risshun.timeUtc.getTime()) {
       yearForPillar = Y - 1;
     }
-
     const yearP = calcYearPillarByRisshun(yearForPillar);
+    const monthP = calcMonthPillarByJie(utcStandard, yearP.kan);
 
-    const monthP = calcMonthPillarByJie(utc, yearP.kan);
+    // -----------------------------
+    // Phase B: 平均太陽時（経度差補正）
+    // ・時柱＆日柱境界に反映
+    // -----------------------------
+    let longitude = null;
+    let lonCorrectionMin = 0;
 
-    // ---- 簡易 日柱・時柱（Phase Cで日境界精密化予定） ----
-    const dayP = calcDayPillarSimple(Y, M, D);
+    if (birthPlace?.country === "JP" && birthPlace?.pref && PREF_LONGITUDE[birthPlace.pref] != null) {
+      longitude = PREF_LONGITUDE[birthPlace.pref];
+    }
 
+    if (timeMode === "mean_solar" && typeof longitude === "number") {
+      lonCorrectionMin = longitudeCorrectionMinutes(longitude);
+    } else {
+      lonCorrectionMin = 0;
+    }
+
+    // 補正後（JST）: usedParts
+    // ※ time が空なら、日柱境界/時柱は判定不能なので "12:00" 等で無理に補正しない
+    let usedParts = { Y, M, D, hh: parsed.hh, mm: parsed.mm, utc: utcStandard };
+    let usedTimeStr = time || "";
+    if (time && time.includes(":") && timeMode === "mean_solar" && lonCorrectionMin !== 0) {
+      // 経度差補正を「JST入力時刻」に加算して “平均太陽時の時計表示” を得る
+      usedParts = addMinutesToJstDateParts(Y, M, D, parsed.hh, parsed.mm, lonCorrectionMin);
+      usedTimeStr = fmtHHMM(usedParts.hh, usedParts.mm);
+    } else {
+      // standard の場合 or 補正なし
+      usedParts = { Y, M, D, hh: parsed.hh, mm: parsed.mm, utc: utcStandard };
+      usedTimeStr = time || "";
+    }
+
+    // -----------------------------
+    // Phase C: 日柱境界 23/24 切替
+    // ・判定は「usedParts（補正後の時刻）」で行う
+    // -----------------------------
+    let dayForPillarY = Y, dayForPillarM = M, dayForPillarD = D;
+
+    if (time && time.includes(":")) {
+      const usedMin = usedParts.hh * 60 + usedParts.mm;
+
+      if (dayBoundaryMode === "23") {
+        // 23:00以降は翌日扱い
+        if (usedMin >= 23 * 60) {
+          const next = addMinutesToJstDateParts(Y, M, D, 0, 0, 24 * 60); // JSTで翌日0:00
+          dayForPillarY = next.Y;
+          dayForPillarM = next.M;
+          dayForPillarD = next.D;
+        }
+      } else {
+        // "24": 0:00で日替わり（通常）
+        // 何もしない
+      }
+    }
+
+    // 日柱（簡易）
+    const dayP = calcDayPillarSimple(dayForPillarY, dayForPillarM, dayForPillarD);
+
+    // 時柱（簡易）: 補正後の時刻（usedParts）で枝を出す
     let hourP = null;
     if (time && time.includes(":")) {
-      const hb = hourBranchFromTime(hh, mm);
+      const hb = hourBranchFromTime(usedParts.hh, usedParts.mm);
       const hs = hourStemFromDayStemAndHourBranch(dayP.kan, hb);
       hourP = { kan: hs, shi: hb };
     }
 
-    // ---- 返却（今は蔵干や五行はstubのままでもOK。Phase B以降で強化） ----
-    // ただしUI/AI連携のため、構造は確定させる
+    // -----------------------------
+    // 返却
+    // -----------------------------
     const result = {
       ok: true,
       input: {
@@ -242,17 +363,27 @@ export default async function handler(req, res) {
       meta: {
         standard: { y: Y, m: M, d: D, time: time || "" },
         used: {
-          y: Y,
-          m: M,
-          d: D,
-          time: time || "",
+          // used は「表示・再現性」優先で、補正後のカレンダー日付も返す
+          y: usedParts.Y ?? Y,
+          m: usedParts.M ?? M,
+          d: usedParts.D ?? D,
+          time: usedTimeStr,
           timeModeUsed: timeMode,
-          dayBoundaryModeUsed: String(dayBoundaryMode),
+          dayBoundaryModeUsed: dayBoundaryMode,
+          // Phase Aで確定した境界情報（実時刻ベース）
           sekkiUsed: monthP.sekkiUsed,
           yearBoundary: risshun ? { name: "立春", timeJst: formatJst(risshun.timeUtc) } : null,
           yearPillarYearUsed: yearForPillar
         },
-        place: birthPlace ? { ...birthPlace } : null
+        place: birthPlace
+          ? {
+              ...birthPlace,
+              ...(typeof longitude === "number" ? { longitude } : {}),
+              ...(timeMode === "mean_solar" && typeof longitude === "number"
+                ? { lonCorrectionMin: Number(lonCorrectionMin.toFixed(2)) }
+                : {})
+            }
+          : null
       },
       pillars: {
         year: { ...yearP, zokan: [], rule: "sekki_risshun" },
