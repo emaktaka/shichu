@@ -1,9 +1,11 @@
 // api/shichusuimei.js
-// Phase A+B+C 統合版（完全コピペ）
+// Phase A+B+C + 「通変星（十神）/ 蔵干十神 / 五行カウント」返却 統合版（完全コピペ）
+//
 // A: 「節入り（24節気→12節）」境界で月柱、立春境界で年柱
 // B: 平均太陽時（経度差補正）を時柱＆日柱境界に反映（都道府県→代表経度）
 // C: 日柱境界を 23:00 or 24:00 で切替（dayBoundaryMode）
-
+// +: 通変星（十神）/ 蔵干十神 / 五行カウント を APIで確定して返す（フロント計算しない）
+//
 // POST /api/shichusuimei
 // body: {
 //   date: "YYYY-MM-DD",
@@ -28,7 +30,6 @@ const BRANCHES = ["子","丑","寅","卯","辰","巳","午","未","申","酉","�
 const MONTH_BRANCHES = ["寅","卯","辰","巳","午","未","申","酉","戌","亥","子","丑"];
 
 // ---- Phase B: 都道府県→代表経度（最小実装として県庁所在地付近） ----
-// ※ 必要なら後で「市区町村」や「海外」対応へ拡張
 const PREF_LONGITUDE = {
   "北海道": 141.35,
   "青森県": 140.74,
@@ -99,34 +100,112 @@ function longitudeCorrectionMinutes(longitude) {
 function pad2(n) {
   return String(n).padStart(2, "0");
 }
-
 function fmtHHMM(h, m) {
   return `${pad2(h)}:${pad2(m)}`;
 }
 
 function addMinutesToJstDateParts(Y, M, D, hh, mm, addMin) {
-  // JSTの(Y,M,D,hh,mm)に分加算して、繰り上がりを正しく扱う
-  // いったん UTC Date にして処理（JST = UTC+9なので、UTCに変換して加算）
+  // JSTの(Y,M,D,hh,mm)に分加算して繰り上がりを正しく扱う
   const utc = new Date(Date.UTC(Y, M - 1, D, hh - 9, mm, 0));
   const utc2 = new Date(utc.getTime() + addMin * 60 * 1000);
   const jst2 = new Date(utc2.getTime() + 9 * 60 * 60 * 1000);
 
-  const y2 = jst2.getUTCFullYear();
-  const mo2 = jst2.getUTCMonth() + 1;
-  const d2 = jst2.getUTCDate();
-  const h2 = jst2.getUTCHours();
-  const mi2 = jst2.getUTCMinutes();
+  return {
+    Y: jst2.getUTCFullYear(),
+    M: jst2.getUTCMonth() + 1,
+    D: jst2.getUTCDate(),
+    hh: jst2.getUTCHours(),
+    mm: jst2.getUTCMinutes(),
+    utc: utc2
+  };
+}
 
-  return { Y: y2, M: mo2, D: d2, hh: h2, mm: mi2, utc: utc2 };
+// ----------------------------
+// 追加: 蔵干（標準テーブル）
+// ----------------------------
+const ZOKAN = {
+  "子": ["癸"],
+  "丑": ["己","癸","辛"],
+  "寅": ["甲","丙","戊"],
+  "卯": ["乙"],
+  "辰": ["戊","乙","癸"],
+  "巳": ["丙","戊","庚"],
+  "午": ["丁","己"],
+  "未": ["己","丁","乙"],
+  "申": ["庚","壬","戊"],
+  "酉": ["辛"],
+  "戌": ["戊","辛","丁"],
+  "亥": ["壬","甲"]
+};
+
+function getZokan(branch) {
+  return ZOKAN[branch] ? [...ZOKAN[branch]] : [];
+}
+
+// ----------------------------
+// 追加: 五行 & 十神（通変星）
+// ----------------------------
+const STEM_ELEMENT = {
+  "甲":"wood","乙":"wood",
+  "丙":"fire","丁":"fire",
+  "戊":"earth","己":"earth",
+  "庚":"metal","辛":"metal",
+  "壬":"water","癸":"water"
+};
+
+const STEM_YINYANG = {
+  "甲":"yang","乙":"yin",
+  "丙":"yang","丁":"yin",
+  "戊":"yang","己":"yin",
+  "庚":"yang","辛":"yin",
+  "壬":"yang","癸":"yin"
+};
+
+const ELEM_GEN = { wood:"fire", fire:"earth", earth:"metal", metal:"water", water:"wood" };
+const ELEM_CTRL = { wood:"earth", earth:"water", water:"fire", fire:"metal", metal:"wood" };
+
+function isStem(v) {
+  return typeof v === "string" && STEM_ELEMENT[v];
+}
+
+function calcTenDeity(dayStem, targetStem) {
+  if (!isStem(dayStem) || !isStem(targetStem)) return null;
+
+  const de = STEM_ELEMENT[dayStem];
+  const te = STEM_ELEMENT[targetStem];
+  const dy = STEM_YINYANG[dayStem];
+  const ty = STEM_YINYANG[targetStem];
+  const samePolarity = dy === ty;
+
+  // 同気
+  if (de === te) return samePolarity ? "比肩" : "劫財";
+
+  // 日主が生む（食傷）
+  if (ELEM_GEN[de] === te) return samePolarity ? "食神" : "傷官";
+
+  // 日主が剋す（財）
+  if (ELEM_CTRL[de] === te) return samePolarity ? "偏財" : "正財";
+
+  // 日主を剋す（官殺）
+  if (ELEM_CTRL[te] === de) return samePolarity ? "七殺" : "正官";
+
+  // 日主を生む（印）
+  if (ELEM_GEN[te] === de) return samePolarity ? "偏印" : "正印";
+
+  return null;
+}
+
+function countFiveElementsFromStems(stems) {
+  const counts = { wood:0, fire:0, earth:0, metal:0, water:0 };
+  for (const s of stems) {
+    if (!isStem(s)) continue;
+    counts[STEM_ELEMENT[s]] += 1;
+  }
+  return counts;
 }
 
 // ---- 年干→寅月の干（五虎遁） ----
 function tigerMonthStemForYearStem(yearStem) {
-  // 甲己年: 丙寅
-  // 乙庚年: 戊寅
-  // 丙辛年: 庚寅
-  // 丁壬年: 壬寅
-  // 戊癸年: 甲寅
   if (yearStem === "甲" || yearStem === "己") return "丙";
   if (yearStem === "乙" || yearStem === "庚") return "戊";
   if (yearStem === "丙" || yearStem === "辛") return "庚";
@@ -141,7 +220,6 @@ function addStem(stem, add) {
 
 // ---- Phase A: 年柱（立春境界） ----
 function calcYearPillarByRisshun(yearNumber) {
-  // 1984年が甲子年として扱う簡易方式
   const idx = (yearNumber - 1984) % 60;
   const i = (idx + 60) % 60;
   return { kan: STEMS[i % 10], shi: BRANCHES[i % 12] };
@@ -164,8 +242,7 @@ function toJdnAtUtcMidnight(y, m, d) {
 }
 
 function calcDayPillarSimple(y, m, d) {
-  // 基準日: 1984-02-02 を 甲子日として扱う簡易方式
-  const baseJdn = toJdnAtUtcMidnight(1984, 2, 2);
+  const baseJdn = toJdnAtUtcMidnight(1984, 2, 2); // 甲子日（簡易基準）
   const jdn = toJdnAtUtcMidnight(y, m, d);
   const diff = jdn - baseJdn;
   const idx = (diff % 60 + 60) % 60;
@@ -174,15 +251,13 @@ function calcDayPillarSimple(y, m, d) {
 
 // ---- 時柱（簡易） ----
 function hourBranchFromTime(hh, mm) {
-  // 子:23-01, 丑:01-03 ... 亥:21-23
   const minutes = hh * 60 + mm;
   if (minutes >= 23 * 60) return "子";
-  const slot = Math.floor((minutes + 60) / 120); // 00:00-00:59 -> 子
+  const slot = Math.floor((minutes + 60) / 120);
   return BRANCHES[slot % 12];
 }
 
 function hourStemFromDayStemAndHourBranch(dayStem, hourBranch) {
-  // 五鼠遁：甲己日 甲子時、乙庚日 丙子時、丙辛日 戊子時、丁壬日 庚子時、戊癸日 壬子時
   let ziStem;
   if (dayStem === "甲" || dayStem === "己") ziStem = "甲";
   else if (dayStem === "乙" || dayStem === "庚") ziStem = "丙";
@@ -299,16 +374,13 @@ export default async function handler(req, res) {
       lonCorrectionMin = 0;
     }
 
-    // 補正後（JST）: usedParts
-    // ※ time が空なら、日柱境界/時柱は判定不能なので "12:00" 等で無理に補正しない
     let usedParts = { Y, M, D, hh: parsed.hh, mm: parsed.mm, utc: utcStandard };
     let usedTimeStr = time || "";
+
     if (time && time.includes(":") && timeMode === "mean_solar" && lonCorrectionMin !== 0) {
-      // 経度差補正を「JST入力時刻」に加算して “平均太陽時の時計表示” を得る
       usedParts = addMinutesToJstDateParts(Y, M, D, parsed.hh, parsed.mm, lonCorrectionMin);
       usedTimeStr = fmtHHMM(usedParts.hh, usedParts.mm);
     } else {
-      // standard の場合 or 補正なし
       usedParts = { Y, M, D, hh: parsed.hh, mm: parsed.mm, utc: utcStandard };
       usedTimeStr = time || "";
     }
@@ -325,14 +397,13 @@ export default async function handler(req, res) {
       if (dayBoundaryMode === "23") {
         // 23:00以降は翌日扱い
         if (usedMin >= 23 * 60) {
-          const next = addMinutesToJstDateParts(Y, M, D, 0, 0, 24 * 60); // JSTで翌日0:00
+          const next = addMinutesToJstDateParts(Y, M, D, 0, 0, 24 * 60);
           dayForPillarY = next.Y;
           dayForPillarM = next.M;
           dayForPillarD = next.D;
         }
       } else {
         // "24": 0:00で日替わり（通常）
-        // 何もしない
       }
     }
 
@@ -346,6 +417,51 @@ export default async function handler(req, res) {
       const hs = hourStemFromDayStemAndHourBranch(dayP.kan, hb);
       hourP = { kan: hs, shi: hb };
     }
+
+    // -----------------------------
+    // 追加: 蔵干を埋める（年/月/日/時）
+    // -----------------------------
+    const yearZ = getZokan(yearP.shi);
+    const monthZ = getZokan(monthP.shi);
+    const dayZ = getZokan(dayP.shi);
+    const hourZ = hourP ? getZokan(hourP.shi) : [];
+
+    // -----------------------------
+    // 追加: 十神（通変星）を確定（基準 = 日干）
+    // - tenDeity: 各柱の「天干」の十神（※日干は "日主" で固定）
+    // - zokanTenDeity: 各柱の蔵干十神配列
+    // -----------------------------
+    const dayStem = dayP.kan;
+
+    const tenDeity = {
+      year: calcTenDeity(dayStem, yearP.kan),
+      month: calcTenDeity(dayStem, monthP.kan),
+      day: "日主",
+      hour: hourP ? calcTenDeity(dayStem, hourP.kan) : null
+    };
+
+    const zokanTenDeity = {
+      year: yearZ.map(stem => ({ stem, deity: calcTenDeity(dayStem, stem) })),
+      month: monthZ.map(stem => ({ stem, deity: calcTenDeity(dayStem, stem) })),
+      day: dayZ.map(stem => ({ stem, deity: calcTenDeity(dayStem, stem) })),
+      hour: hourP ? hourZ.map(stem => ({ stem, deity: calcTenDeity(dayStem, stem) })) : []
+    };
+
+    // -----------------------------
+    // 追加: 五行カウント（確定値）
+    // 方針：天干（年/月/日/時）＋ 蔵干（年/月/日/時）を全部カウント
+    // -----------------------------
+    const stemsToCount = [
+      yearP.kan,
+      monthP.kan,
+      dayP.kan,
+      ...(hourP ? [hourP.kan] : []),
+      ...yearZ,
+      ...monthZ,
+      ...dayZ,
+      ...hourZ
+    ];
+    const fiveCounts = countFiveElementsFromStems(stemsToCount);
 
     // -----------------------------
     // 返却
@@ -363,14 +479,12 @@ export default async function handler(req, res) {
       meta: {
         standard: { y: Y, m: M, d: D, time: time || "" },
         used: {
-          // used は「表示・再現性」優先で、補正後のカレンダー日付も返す
           y: usedParts.Y ?? Y,
           m: usedParts.M ?? M,
           d: usedParts.D ?? D,
           time: usedTimeStr,
           timeModeUsed: timeMode,
           dayBoundaryModeUsed: dayBoundaryMode,
-          // Phase Aで確定した境界情報（実時刻ベース）
           sekkiUsed: monthP.sekkiUsed,
           yearBoundary: risshun ? { name: "立春", timeJst: formatJst(risshun.timeUtc) } : null,
           yearPillarYearUsed: yearForPillar
@@ -386,14 +500,17 @@ export default async function handler(req, res) {
           : null
       },
       pillars: {
-        year: { ...yearP, zokan: [], rule: "sekki_risshun" },
-        month: { kan: monthP.kan, shi: monthP.shi, zokan: [], rule: "sekki_12jie" },
-        day: { ...dayP, zokan: [], rule: "day_simple_phaseA" },
-        hour: hourP ? { ...hourP, zokan: [], rule: "hour_simple_phaseA" } : null
+        year: { ...yearP, zokan: yearZ, rule: "sekki_risshun" },
+        month: { kan: monthP.kan, shi: monthP.shi, zokan: monthZ, rule: "sekki_12jie" },
+        day: { ...dayP, zokan: dayZ, rule: "day_simple_phaseA" },
+        hour: hourP ? { ...hourP, zokan: hourZ, rule: "hour_simple_phaseA" } : null
       },
       derived: {
+        tenDeity,
+        zokanTenDeity,
         fiveElements: {
-          counts: { wood: 0, fire: 0, earth: 0, metal: 0, water: 0 }
+          counts: fiveCounts,
+          note: "Counted from stems: year/month/day/hour + all hidden stems (zokan)."
         }
       }
     };
