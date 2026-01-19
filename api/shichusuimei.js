@@ -1,6 +1,7 @@
 // api/shichusuimei.js
 // Phase A: 「節入り（24節気）」の境界で月柱（＋年柱の立春境界）を確定する
-// Phase B: 「真太陽時（平均太陽時）」= 経度差補正（明石135°基準）
+// Phase B: 「平均太陽時」= 経度差補正（明石135°基準）
+// Phase B+: 「真太陽時」= 平均太陽時 + 均時差(EoT)
 // Phase C: 「日干支の23時/24時切替」(入力 dayBoundaryMode)
 // Phase D: 「大運/年運」+ 年運は立春境界で切る精密版
 // Phase D+: 起運年齢を“分単位”で厳密計算（節までの差分Minutes ÷ (3日換算)）
@@ -11,9 +12,9 @@
 //   time: "HH:MM" | "",
 //   sex: "M"|"F"|"",
 //   birthPlace: {country:"JP", pref:"東京都"} | null,
-//   timeMode: "standard"|"mean_solar",
+//   timeMode: "standard"|"mean_solar"|"true_solar",
 //   dayBoundaryMode: "23"|"24",
-//   asOfDate?: "YYYY-MM-DD"   // 任意：年運/大運の「現在」をこの日付で判定（なければサーバー当日）
+//   asOfDate?: "YYYY-MM-DD"
 // }
 //
 // env:
@@ -25,8 +26,6 @@ import { buildJie12Utc, formatJst } from "../lib/sekki.js";
 // ---- 干支ユーティリティ ----
 const STEMS = ["甲","乙","丙","丁","戊","己","庚","辛","壬","癸"];
 const BRANCHES = ["子","丑","寅","卯","辰","巳","午","未","申","酉","戌","亥"];
-
-// 月支（寅から順）
 const MONTH_BRANCHES = ["寅","卯","辰","巳","午","未","申","酉","戌","亥","子","丑"];
 
 // ---- Phase B: 都道府県 → 代表経度（最小マップ）----
@@ -42,16 +41,49 @@ const PREF_LONGITUDE = {
   "沖縄県": 127.68
 };
 
-// 年干→寅月の干（五虎遁）
+// ========== Phase B+ 均時差（Equation of Time / EoT） ==========
+// 返り値：分（+ は「真太陽時が平均太陽時より進む」扱いで加算）
+// 実装は一般的な近似式（NOAA等の近似）で、四柱推命用途の分単位補正としては十分実用。
+// ※将来さらに天文計算を精密化する場合はここを差し替え可能。
+function equationOfTimeMinutes(dateUtc) {
+  // dateUtc: UTC Date（JST日時をUTCにしたものでもOK）
+  // まず「その日の通日」を求める（UTC基準）
+  const y = dateUtc.getUTCFullYear();
+  const m = dateUtc.getUTCMonth() + 1;
+  const d = dateUtc.getUTCDate();
+
+  // day of year
+  const start = Date.UTC(y, 0, 1);
+  const today = Date.UTC(y, m - 1, d);
+  const n = Math.floor((today - start) / (24 * 3600 * 1000)) + 1;
+
+  // fractional year (radians) - 12:00を仮定（分単位EoTには十分）
+  const gamma = (2 * Math.PI / 365) * (n - 1 + (12 - 12) / 24);
+
+  // EoT in minutes (NOAA approximation)
+  const eot =
+    229.18 * (
+      0.000075
+      + 0.001868 * Math.cos(gamma)
+      - 0.032077 * Math.sin(gamma)
+      - 0.014615 * Math.cos(2 * gamma)
+      - 0.040849 * Math.sin(2 * gamma)
+    );
+
+  // NOAAの式は「見かけ太陽時 − 平均太陽時」の符号系が混在しがちなので、
+  // このプロジェクトでは「真太陽時 = 平均太陽時 + eqTimeMin」として統一。
+  // そのため eot をそのまま eqTimeMin として加算します。
+  return eot;
+}
+
+// ---- 年干→寅月の干（五虎遁） ----
 function tigerMonthStemForYearStem(yearStem) {
-  // 甲己年: 丙寅 / 乙庚年: 戊寅 / 丙辛年: 庚寅 / 丁壬年: 壬寅 / 戊癸年: 甲寅
   if (yearStem === "甲" || yearStem === "己") return "丙";
   if (yearStem === "乙" || yearStem === "庚") return "戊";
   if (yearStem === "丙" || yearStem === "辛") return "庚";
   if (yearStem === "丁" || yearStem === "壬") return "壬";
-  return "甲"; // 戊 or 癸
+  return "甲";
 }
-
 function addStem(stem, add) {
   const i = STEMS.indexOf(stem);
   return STEMS[(i + add + 10) % 10];
@@ -61,9 +93,8 @@ function addBranch(branch, add) {
   return BRANCHES[(i + add + 12) % 12];
 }
 
-// ---- Phase A: 年柱の干支（立春境界） ----
+// ---- Phase A: 年柱（立春境界） ----
 function calcYearPillarByRisshun(yearNumber) {
-  // 1984年が甲子年
   const idx = (yearNumber - 1984) % 60;
   const i = (idx + 60) % 60;
   return { kan: STEMS[i % 10], shi: BRANCHES[i % 12] };
@@ -85,7 +116,6 @@ function toJdnAtUtcMidnight(y, m, d) {
   return jdn;
 }
 function calcDayPillarSimpleByYMD(y, m, d) {
-  // 基準日: 1984-02-02 を 甲子日
   const baseJdn = toJdnAtUtcMidnight(1984, 2, 2);
   const jdn = toJdnAtUtcMidnight(y, m, d);
   const diff = jdn - baseJdn;
@@ -107,7 +137,7 @@ function calcDayPillarWithBoundary({ Y, M, D, hh, mm, dayBoundaryMode }) {
   return calcDayPillarSimpleByYMD(y, m, d);
 }
 
-// ---- 時柱（簡易：真太陽時補正後の時刻で判定） ----
+// ---- 時柱（真太陽時補正後の時刻で判定） ----
 function hourBranchFromTime(hh, mm) {
   const minutes = hh * 60 + mm;
   if (minutes >= 23 * 60) return "子";
@@ -121,23 +151,18 @@ function hourStemFromDayStemAndHourBranch(dayStem, hourBranch) {
   else if (dayStem === "丙" || dayStem === "辛") ziStem = "戊";
   else if (dayStem === "丁" || dayStem === "壬") ziStem = "庚";
   else ziStem = "壬";
-
   const ziIndex = STEMS.indexOf(ziStem);
   const hbIndex = BRANCHES.indexOf(hourBranch);
   return STEMS[(ziIndex + hbIndex) % 10];
 }
 
-// ---- 月柱：節入り（12節）で境界を切る ----
+// ---- 月柱：節入り（12節）で境界 ----
 function calcMonthPillarByJie(dateUtcForJst, yearPillarStem) {
   const yJst = new Date(dateUtcForJst.getTime() + 9 * 3600 * 1000).getUTCFullYear();
-
   const jiePrev = buildJie12Utc(yJst - 1);
   const jieThis = buildJie12Utc(yJst);
   const jieNext = buildJie12Utc(yJst + 1);
-
-  const all = [...jiePrev, ...jieThis, ...jieNext].sort(
-    (a, b) => a.timeUtc.getTime() - b.timeUtc.getTime()
-  );
+  const all = [...jiePrev, ...jieThis, ...jieNext].sort((a, b) => a.timeUtc.getTime() - b.timeUtc.getTime());
 
   let latest = null;
   for (const j of all) {
@@ -161,7 +186,7 @@ function calcMonthPillarByJie(dateUtcForJst, yearPillarStem) {
   };
 }
 
-// ---- 入力処理（JST入力→UTC Date） ----
+// ---- 入力処理 ----
 function parseDateTimeJstToUtc(dateStr, timeStr) {
   const [Y, M, D] = dateStr.split("-").map((v) => parseInt(v, 10));
   let hh = 12, mm = 0;
@@ -176,7 +201,7 @@ function parseDateTimeJstToUtc(dateStr, timeStr) {
 function pad2(n) { return String(n).padStart(2, "0"); }
 function fmtHHMM(hh, mm) { return `${pad2(hh)}:${pad2(mm)}`; }
 
-// ---- 十神（通変星）計算 ----
+// ---- 十神（通変星） ----
 const STEM_INFO = {
   "甲": { elem: "wood", yin: "yang" }, "乙": { elem: "wood", yin: "yin" },
   "丙": { elem: "fire", yin: "yang" }, "丁": { elem: "fire", yin: "yin" },
@@ -197,7 +222,6 @@ function relationElem(dayElem, otherElem) {
   const controls = { wood: "earth", fire: "metal", earth: "water", metal: "wood", water: "fire" };
   if (controls[dayElem] === otherElem) return "control_out";
   if (controls[otherElem] === dayElem) return "control_in";
-
   return "same";
 }
 function tenDeity(dayStem, otherStem) {
@@ -206,7 +230,6 @@ function tenDeity(dayStem, otherStem) {
   const d = STEM_INFO[dayStem];
   const o = STEM_INFO[otherStem];
   if (!d || !o) return null;
-
   const rel = relationElem(d.elem, o.elem);
   const samePolarity = d.yin === o.yin;
 
@@ -218,7 +241,7 @@ function tenDeity(dayStem, otherStem) {
   return null;
 }
 
-// ---- 蔵干表（全支）----
+// ---- 蔵干表 ----
 const ZOKAN_TABLE = {
   "子": ["癸"],
   "丑": ["己","癸","辛"],
@@ -235,9 +258,7 @@ const ZOKAN_TABLE = {
 };
 
 // ---- 五行カウント ----
-function elementOfStem(stem) {
-  return STEM_INFO[stem]?.elem || null;
-}
+function elementOfStem(stem) { return STEM_INFO[stem]?.elem || null; }
 function countFiveElementsFromPillars(pillars) {
   const counts = { wood: 0, fire: 0, earth: 0, metal: 0, water: 0 };
   const addStemCount = (s) => {
@@ -260,10 +281,7 @@ function countFiveElementsFromPillars(pillars) {
 }
 
 // ---- 大運/年運 ----
-function isYangStem(stem) {
-  const yin = STEM_INFO[stem]?.yin;
-  return yin === "yang";
-}
+function isYangStem(stem) { return STEM_INFO[stem]?.yin === "yang"; }
 function calcDirection(yearStem, sex) {
   if (!sex || (sex !== "M" && sex !== "F")) return null;
   const yang = isYangStem(yearStem);
@@ -272,7 +290,6 @@ function calcDirection(yearStem, sex) {
   if (!yang && sex === "M") return "backward";
   return "forward";
 }
-
 function findNearestJieForStart(birthUtc, direction) {
   const yJst = new Date(birthUtc.getTime() + 9 * 3600 * 1000).getUTCFullYear();
   const all = [
@@ -288,12 +305,8 @@ function findNearestJieForStart(birthUtc, direction) {
   }
   if (!prev) prev = all[0];
   if (!next) next = all[all.length - 1];
-
   return direction === "backward" ? prev : next;
 }
-
-// Phase D+：起運年齢（分単位で厳密）
-// 古典「3日＝1年」換算 → years = diffMinutes / (3*24*60)
 function calcStartAgeByJieDiffMinutes(birthUtc, targetJie) {
   const diffMs = Math.abs(targetJie.timeUtc.getTime() - birthUtc.getTime());
   const diffMinutes = diffMs / (1000 * 60);
@@ -301,52 +314,40 @@ function calcStartAgeByJieDiffMinutes(birthUtc, targetJie) {
   const minutesPerYear = 3 * 24 * 60; // 3 days
   const yearsExact = diffMinutes / minutesPerYear;
 
-  // UI/説明用：年・月・日 へ分解（※表示用の近似）
   const yearsInt = Math.floor(yearsExact);
   const monthsExact = (yearsExact - yearsInt) * 12;
   const monthsInt = Math.floor(monthsExact);
-  const daysApprox = Math.round((monthsExact - monthsInt) * 30.44); // 平均月日数（近似）
+  const daysApprox = Math.round((monthsExact - monthsInt) * 30.44);
 
   const yearsRounded1 = Math.round(yearsExact * 10) / 10;
 
   return {
     yearsExact,
     yearsRounded1,
-    detail: {
-      years: yearsInt,
-      months: monthsInt,
-      days: daysApprox
-    },
+    detail: { years: yearsInt, months: monthsInt, days: daysApprox },
     diffMinutes: Math.round(diffMinutes)
   };
 }
-
 function buildDayun(monthPillar, direction, startAgeYears, count = 10, dayStemForTenDeity) {
   const step = direction === "backward" ? -1 : 1;
-
   const list = [];
   for (let i = 0; i < count; i++) {
     const n = i + 1;
     const kan = addStem(monthPillar.kan, step * n);
     const shi = addBranch(monthPillar.shi, step * n);
-
     const ageFrom = Math.round((startAgeYears + (i * 10)) * 10) / 10;
     const ageTo = Math.round((startAgeYears + ((i + 1) * 10)) * 10) / 10;
-
     list.push({
-      kan,
-      shi,
+      kan, shi,
       tenDeity: dayStemForTenDeity ? tenDeity(dayStemForTenDeity, kan) : null,
-      ageFrom,
-      ageTo
+      ageFrom, ageTo
     });
   }
   return list;
 }
-
 function getRisshunUtcForYear(y) {
   const jie = buildJie12Utc(y);
-  return jie.find(j => j.angle === 315) || null; // 立春
+  return jie.find(j => j.angle === 315) || null;
 }
 function parseAsOfDateJstToUtc(asOfDateStr) {
   const [Y, M, D] = asOfDateStr.split("-").map((v) => parseInt(v, 10));
@@ -355,10 +356,8 @@ function parseAsOfDateJstToUtc(asOfDateStr) {
 function getNenunYearByRisshun(asOfUtc) {
   const asOfJst = new Date(asOfUtc.getTime() + 9 * 3600 * 1000);
   const y = asOfJst.getUTCFullYear();
-
   const r = getRisshunUtcForYear(y);
   if (!r) return y;
-
   if (asOfUtc.getTime() < r.timeUtc.getTime()) return y - 1;
   return y;
 }
@@ -422,25 +421,40 @@ export default async function handler(req, res) {
     const stdMM = parsed.mm;
     const stdHHMM = time ? fmtHHMM(stdHH, stdMM) : "";
 
-    // --- Phase B: 平均太陽時補正 ---
+    // --- Phase B / B+ 補正 ---
     let usedUtc = new Date(stdUtc.getTime());
     let usedHH = stdHH;
     let usedMM = stdMM;
 
     let longitude = null;
     let lonCorrectionMin = 0;
+    let eqTimeMin = 0;
 
-    if (timeMode === "mean_solar" && birthPlace?.country === "JP" && birthPlace?.pref) {
+    const wantsMeanSolar = timeMode === "mean_solar" || timeMode === "true_solar";
+    const wantsTrueSolar = timeMode === "true_solar";
+
+    if (wantsMeanSolar && birthPlace?.country === "JP" && birthPlace?.pref) {
       longitude = PREF_LONGITUDE[birthPlace.pref] ?? null;
+
       if (longitude != null && time) {
+        // 経度差（平均太陽時）
         lonCorrectionMin = (longitude - 135) * 4;
         usedUtc = new Date(usedUtc.getTime() + lonCorrectionMin * 60 * 1000);
+
+        // 均時差（真太陽時）
+        if (wantsTrueSolar) {
+          // EoTは「その日付」の値でOK（分単位補正）
+          // ※ usedUtc の日付（UTC）で計算しても、実用上は十分一致します
+          eqTimeMin = equationOfTimeMinutes(usedUtc);
+          usedUtc = new Date(usedUtc.getTime() + eqTimeMin * 60 * 1000);
+        }
 
         const usedJst = new Date(usedUtc.getTime() + 9 * 3600 * 1000);
         usedHH = usedJst.getUTCHours();
         usedMM = usedJst.getUTCMinutes();
       }
     }
+
     const usedHHMM = time ? fmtHHMM(usedHH, usedMM) : "";
 
     // ---- Phase A: 立春で年替わり & 節で月替わり ----
@@ -452,7 +466,6 @@ export default async function handler(req, res) {
       yearForPillar = Y - 1;
     }
     const yearP = calcYearPillarByRisshun(yearForPillar);
-
     const monthP = calcMonthPillarByJie(usedUtc, yearP.kan);
 
     // ---- Phase C: 日柱（23/24切替）----
@@ -510,7 +523,6 @@ export default async function handler(req, res) {
     if (direction) {
       const targetJie = findNearestJieForStart(usedUtc, direction);
 
-      // ★Phase D+：分単位の起運
       const start = calcStartAgeByJieDiffMinutes(usedUtc, targetJie);
       startAgeYears = start.yearsRounded1;
       startAgeDetail = start.detail;
@@ -570,11 +582,12 @@ export default async function handler(req, res) {
       place: birthPlace ? { ...birthPlace } : null
     };
 
-    if (timeMode === "mean_solar" && birthPlace?.country === "JP" && birthPlace?.pref) {
+    if ((timeMode === "mean_solar" || timeMode === "true_solar") && birthPlace?.country === "JP" && birthPlace?.pref) {
       meta.place = {
         ...(birthPlace ? { ...birthPlace } : {}),
         longitude: longitude,
-        lonCorrectionMin: Number((lonCorrectionMin).toFixed(2))
+        lonCorrectionMin: Number((lonCorrectionMin).toFixed(2)),
+        ...(timeMode === "true_solar" ? { eqTimeMin: Number((eqTimeMin).toFixed(2)) } : {})
       };
     }
 
@@ -603,7 +616,7 @@ export default async function handler(req, res) {
           startCalcMode: startCalcMode || null,
           startDiffMinutes: startDiffMinutes ?? null,
           startAgeYears: startAgeYears ?? null,
-          startAgeDetail: startAgeDetail ?? null, // ★追加（UI表示・AI説明にも使える）
+          startAgeDetail: startAgeDetail ?? null,
           current: current || null,
           dayun: dayun || null,
           nenun: nenun || null,
