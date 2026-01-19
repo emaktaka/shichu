@@ -3,6 +3,7 @@
 // Phase B: 「真太陽時（平均太陽時）」= 経度差補正（明石135°基準）
 // Phase C: 「日干支の23時/24時切替」(入力 dayBoundaryMode)
 // Phase D: 「大運/年運」+ 年運は立春境界で切る精密版
+// Phase D+: 起運年齢を“分単位”で厳密計算（節までの差分Minutes ÷ (3日換算)）
 //
 // POST /api/shichusuimei
 // body: {
@@ -69,7 +70,6 @@ function calcYearPillarByRisshun(yearNumber) {
 }
 
 // ---- Phase C: 日柱 23/24 境界（簡易日干支） ----
-// ※Phase Aの簡易方式を保ちつつ、境界だけ切り替え可能にする
 function toJdnAtUtcMidnight(y, m, d) {
   const a = Math.floor((14 - m) / 12);
   const y2 = y + 4800 - a;
@@ -93,13 +93,10 @@ function calcDayPillarSimpleByYMD(y, m, d) {
   return { kan: STEMS[idx % 10], shi: BRANCHES[idx % 12] };
 }
 function calcDayPillarWithBoundary({ Y, M, D, hh, mm, dayBoundaryMode }) {
-  // dayBoundaryMode "24": 0:00で日替わり（そのままYMD）
-  // dayBoundaryMode "23": 23:00以降は翌日扱い（古流の境界）
   let y = Y, m = M, d = D;
   if (String(dayBoundaryMode) === "23") {
     const minutes = hh * 60 + mm;
     if (minutes >= 23 * 60) {
-      // 翌日へ（簡易）
       const dt = new Date(Date.UTC(Y, M - 1, D, 0, 0, 0));
       dt.setUTCDate(dt.getUTCDate() + 1);
       y = dt.getUTCFullYear();
@@ -112,14 +109,12 @@ function calcDayPillarWithBoundary({ Y, M, D, hh, mm, dayBoundaryMode }) {
 
 // ---- 時柱（簡易：真太陽時補正後の時刻で判定） ----
 function hourBranchFromTime(hh, mm) {
-  // 子:23-01, 丑:01-03 ... 亥:21-23
   const minutes = hh * 60 + mm;
   if (minutes >= 23 * 60) return "子";
   const slot = Math.floor((minutes + 60) / 120);
   return BRANCHES[slot % 12];
 }
 function hourStemFromDayStemAndHourBranch(dayStem, hourBranch) {
-  // 五鼠遁：甲己日 甲子時、乙庚日 丙子時、丙辛日 戊子時、丁壬日 庚子時、戊癸日 壬子時
   let ziStem;
   if (dayStem === "甲" || dayStem === "己") ziStem = "甲";
   else if (dayStem === "乙" || dayStem === "庚") ziStem = "丙";
@@ -132,7 +127,7 @@ function hourStemFromDayStemAndHourBranch(dayStem, hourBranch) {
   return STEMS[(ziIndex + hbIndex) % 10];
 }
 
-// ---- 月柱：節入り（12節）で境界を切る（Phase Aの本体） ----
+// ---- 月柱：節入り（12節）で境界を切る ----
 function calcMonthPillarByJie(dateUtcForJst, yearPillarStem) {
   const yJst = new Date(dateUtcForJst.getTime() + 9 * 3600 * 1000).getUTCFullYear();
 
@@ -178,11 +173,10 @@ function parseDateTimeJstToUtc(dateStr, timeStr) {
   const utc = new Date(Date.UTC(Y, M - 1, D, hh - 9, mm, 0));
   return { Y, M, D, hh, mm, utc };
 }
-
 function pad2(n) { return String(n).padStart(2, "0"); }
 function fmtHHMM(hh, mm) { return `${pad2(hh)}:${pad2(mm)}`; }
 
-// ---- Phase D: 十神（通変星）計算（干→五行/陰陽） ----
+// ---- 十神（通変星）計算 ----
 const STEM_INFO = {
   "甲": { elem: "wood", yin: "yang" }, "乙": { elem: "wood", yin: "yin" },
   "丙": { elem: "fire", yin: "yang" }, "丁": { elem: "fire", yin: "yin" },
@@ -191,21 +185,19 @@ const STEM_INFO = {
   "壬": { elem: "water", yin: "yang" }, "癸": { elem: "water", yin: "yin" }
 };
 function relationElem(dayElem, otherElem) {
-  // return: "same" | "produce_out" | "produce_in" | "control_out" | "control_in"
-  // 生： wood->fire->earth->metal->water->wood
   const order = ["wood","fire","earth","metal","water"];
   const di = order.indexOf(dayElem);
   const oi = order.indexOf(otherElem);
   if (di < 0 || oi < 0) return "same";
   if (dayElem === otherElem) return "same";
-  // day produces other
+
   if (order[(di + 1) % 5] === otherElem) return "produce_out";
-  // other produces day
   if (order[(oi + 1) % 5] === dayElem) return "produce_in";
-  // day controls other: wood controls earth, fire controls metal, earth controls water, metal controls wood, water controls fire
+
   const controls = { wood: "earth", fire: "metal", earth: "water", metal: "wood", water: "fire" };
   if (controls[dayElem] === otherElem) return "control_out";
   if (controls[otherElem] === dayElem) return "control_in";
+
   return "same";
 }
 function tenDeity(dayStem, otherStem) {
@@ -218,23 +210,15 @@ function tenDeity(dayStem, otherStem) {
   const rel = relationElem(d.elem, o.elem);
   const samePolarity = d.yin === o.yin;
 
-  // 伝統的な割当
-  // same: 比肩(同陰陽)/劫財(異陰陽)
   if (rel === "same") return samePolarity ? "比肩" : "劫財";
-  // produce_out: 食神(同)/傷官(異)
   if (rel === "produce_out") return samePolarity ? "食神" : "傷官";
-  // produce_in: 偏印(同)/印綬(異)  ※流派で呼称が逆の場合あり（ここは一般的な並び）
   if (rel === "produce_in") return samePolarity ? "偏印" : "印綬";
-  // control_out: 偏財(同)/正財(異)
   if (rel === "control_out") return samePolarity ? "偏財" : "正財";
-  // control_in: 七殺(同)/正官(異)
   if (rel === "control_in") return samePolarity ? "七殺" : "正官";
-
   return null;
 }
 
-// ---- Phase D: 蔵干（簡易） ----
-// ※最小の蔵干表（必要分のみ）— 全支を用意（のちに精密版へ差し替え可能）
+// ---- 蔵干表（全支）----
 const ZOKAN_TABLE = {
   "子": ["癸"],
   "丑": ["己","癸","辛"],
@@ -250,25 +234,22 @@ const ZOKAN_TABLE = {
   "亥": ["壬","甲"]
 };
 
-// ---- Phase D: 五行カウント ----
+// ---- 五行カウント ----
 function elementOfStem(stem) {
   return STEM_INFO[stem]?.elem || null;
 }
 function countFiveElementsFromPillars(pillars) {
   const counts = { wood: 0, fire: 0, earth: 0, metal: 0, water: 0 };
-
   const addStemCount = (s) => {
     const e = elementOfStem(s);
     if (e) counts[e] += 1;
   };
 
-  // 表干
   addStemCount(pillars.year.kan);
   addStemCount(pillars.month.kan);
   addStemCount(pillars.day.kan);
   if (pillars.hour) addStemCount(pillars.hour.kan);
 
-  // 蔵干
   for (const k of ["year","month","day","hour"]) {
     const p = pillars[k];
     if (!p) continue;
@@ -278,24 +259,21 @@ function countFiveElementsFromPillars(pillars) {
   return counts;
 }
 
-// ---- Phase D: 大運 / 年運 ----
+// ---- 大運/年運 ----
 function isYangStem(stem) {
   const yin = STEM_INFO[stem]?.yin;
   return yin === "yang";
 }
 function calcDirection(yearStem, sex) {
-  // よく使われるルール：
-  // 陽年：男=順行 女=逆行 / 陰年：男=逆行 女=順行
   if (!sex || (sex !== "M" && sex !== "F")) return null;
   const yang = isYangStem(yearStem);
   if (yang && sex === "M") return "forward";
   if (yang && sex === "F") return "backward";
   if (!yang && sex === "M") return "backward";
-  return "forward"; // !yang && F
+  return "forward";
 }
 
 function findNearestJieForStart(birthUtc, direction) {
-  // 起運：順行→次の節、逆行→前の節までの日数を使う（節＝12節）
   const yJst = new Date(birthUtc.getTime() + 9 * 3600 * 1000).getUTCFullYear();
   const all = [
     ...buildJie12Utc(yJst - 1),
@@ -314,22 +292,41 @@ function findNearestJieForStart(birthUtc, direction) {
   return direction === "backward" ? prev : next;
 }
 
-function calcStartAgeYearsByJieDiff(birthUtc, targetJie) {
-  // 古典：節までの日数 ÷ 3 ＝ 起運年齢（年）
+// Phase D+：起運年齢（分単位で厳密）
+// 古典「3日＝1年」換算 → years = diffMinutes / (3*24*60)
+function calcStartAgeByJieDiffMinutes(birthUtc, targetJie) {
   const diffMs = Math.abs(targetJie.timeUtc.getTime() - birthUtc.getTime());
-  const diffDays = diffMs / (1000 * 60 * 60 * 24);
-  const years = diffDays / 3;
-  // UI向けに小数1桁
-  return Math.round(years * 10) / 10;
+  const diffMinutes = diffMs / (1000 * 60);
+
+  const minutesPerYear = 3 * 24 * 60; // 3 days
+  const yearsExact = diffMinutes / minutesPerYear;
+
+  // UI/説明用：年・月・日 へ分解（※表示用の近似）
+  const yearsInt = Math.floor(yearsExact);
+  const monthsExact = (yearsExact - yearsInt) * 12;
+  const monthsInt = Math.floor(monthsExact);
+  const daysApprox = Math.round((monthsExact - monthsInt) * 30.44); // 平均月日数（近似）
+
+  const yearsRounded1 = Math.round(yearsExact * 10) / 10;
+
+  return {
+    yearsExact,
+    yearsRounded1,
+    detail: {
+      years: yearsInt,
+      months: monthsInt,
+      days: daysApprox
+    },
+    diffMinutes: Math.round(diffMinutes)
+  };
 }
 
 function buildDayun(monthPillar, direction, startAgeYears, count = 10, dayStemForTenDeity) {
-  // 月柱からスタートし、順行なら+1、逆行なら-1で干支を進める。各10年刻み。
   const step = direction === "backward" ? -1 : 1;
 
   const list = [];
   for (let i = 0; i < count; i++) {
-    const n = i + 1; // 1運目は月柱の次として扱う流派が多いが、ここでは「月柱から+1」を1運目にする
+    const n = i + 1;
     const kan = addStem(monthPillar.kan, step * n);
     const shi = addBranch(monthPillar.shi, step * n);
 
@@ -351,28 +348,21 @@ function getRisshunUtcForYear(y) {
   const jie = buildJie12Utc(y);
   return jie.find(j => j.angle === 315) || null; // 立春
 }
-
 function parseAsOfDateJstToUtc(asOfDateStr) {
-  // asOfDate: YYYY-MM-DD（JSTの0時として扱う）
   const [Y, M, D] = asOfDateStr.split("-").map((v) => parseInt(v, 10));
-  return new Date(Date.UTC(Y, M - 1, D, -9, 0, 0)); // JST 00:00 -> UTC -9h
+  return new Date(Date.UTC(Y, M - 1, D, -9, 0, 0));
 }
-
 function getNenunYearByRisshun(asOfUtc) {
-  // asOfUtc を JST 年に直して、その年の立春と比較して「年運年」を確定
   const asOfJst = new Date(asOfUtc.getTime() + 9 * 3600 * 1000);
   const y = asOfJst.getUTCFullYear();
 
   const r = getRisshunUtcForYear(y);
   if (!r) return y;
 
-  // asOf が立春より前なら前年扱い
   if (asOfUtc.getTime() < r.timeUtc.getTime()) return y - 1;
   return y;
 }
-
 function buildNenunList(centerYear, span = 6, dayStemForTenDeity) {
-  // centerYear を中心に (span*2+1) 年返す（例：前後6年=13年分）
   const list = [];
   for (let y = centerYear - span; y <= centerYear + span; y++) {
     const yp = calcYearPillarByRisshun(y);
@@ -385,22 +375,17 @@ function buildNenunList(centerYear, span = 6, dayStemForTenDeity) {
   }
   return list;
 }
-
 function pickCurrentDayunIndex(dayun, ageYears) {
   if (!Array.isArray(dayun) || dayun.length === 0) return -1;
   for (let i = 0; i < dayun.length; i++) {
     const d = dayun[i];
     if (ageYears >= d.ageFrom && ageYears < d.ageTo) return i;
   }
-  // 範囲外の場合：最も近い
   if (ageYears < dayun[0].ageFrom) return 0;
   return dayun.length - 1;
 }
-
 function calcAgeYearsAtAsOf(birthDateJstYMD, asOfUtc) {
-  // birthDateJstYMD: {Y,M,D} (JST日付)
-  // asOfUtc: UTC Date（JST換算の“現在日”）
-  const birth = new Date(Date.UTC(birthDateJstYMD.Y, birthDateJstYMD.M - 1, birthDateJstYMD.D, -9, 0, 0)); // JST 00:00
+  const birth = new Date(Date.UTC(birthDateJstYMD.Y, birthDateJstYMD.M - 1, birthDateJstYMD.D, -9, 0, 0));
   const diffDays = (asOfUtc.getTime() - birth.getTime()) / (1000 * 60 * 60 * 24);
   return Math.max(0, Math.round((diffDays / 365.2425) * 10) / 10);
 }
@@ -431,13 +416,13 @@ export default async function handler(req, res) {
     const parsed = parseDateTimeJstToUtc(date, time);
     const { Y, M, D } = parsed;
 
-    // standard（入力そのままのJST時刻）
+    // standard
     const stdUtc = parsed.utc;
     const stdHH = parsed.hh;
     const stdMM = parsed.mm;
     const stdHHMM = time ? fmtHHMM(stdHH, stdMM) : "";
 
-    // --- Phase B: 平均太陽時補正（usedUtc / usedHHMM を作る） ---
+    // --- Phase B: 平均太陽時補正 ---
     let usedUtc = new Date(stdUtc.getTime());
     let usedHH = stdHH;
     let usedMM = stdMM;
@@ -448,10 +433,9 @@ export default async function handler(req, res) {
     if (timeMode === "mean_solar" && birthPlace?.country === "JP" && birthPlace?.pref) {
       longitude = PREF_LONGITUDE[birthPlace.pref] ?? null;
       if (longitude != null && time) {
-        lonCorrectionMin = (longitude - 135) * 4; // 明石135°との差×4分
+        lonCorrectionMin = (longitude - 135) * 4;
         usedUtc = new Date(usedUtc.getTime() + lonCorrectionMin * 60 * 1000);
 
-        // usedUtc を JST 表示の hh:mm に再反映
         const usedJst = new Date(usedUtc.getTime() + 9 * 3600 * 1000);
         usedHH = usedJst.getUTCHours();
         usedMM = usedJst.getUTCMinutes();
@@ -460,7 +444,6 @@ export default async function handler(req, res) {
     const usedHHMM = time ? fmtHHMM(usedHH, usedMM) : "";
 
     // ---- Phase A: 立春で年替わり & 節で月替わり ----
-    // 年柱の立春は「入力日（JST）の年」で取得し、usedUtc と比較する
     const jieThis = buildJie12Utc(Y);
     const risshun = jieThis.find(j => j.angle === 315) || null;
 
@@ -470,13 +453,12 @@ export default async function handler(req, res) {
     }
     const yearP = calcYearPillarByRisshun(yearForPillar);
 
-    // 月柱：節入り（12節）— 判定は usedUtc（平均太陽時補正後）で行う
     const monthP = calcMonthPillarByJie(usedUtc, yearP.kan);
 
-    // ---- Phase C: 日柱（23/24切替）— 判定は usedHH:usedMM を使う ----
+    // ---- Phase C: 日柱（23/24切替）----
     const dayP = calcDayPillarWithBoundary({ Y, M, D, hh: usedHH, mm: usedMM, dayBoundaryMode });
 
-    // ---- 時柱：判定は usedHH:usedMM を使う ----
+    // ---- 時柱：used時刻で判定 ----
     let hourP = null;
     if (time && time.includes(":")) {
       const hb = hourBranchFromTime(usedHH, usedMM);
@@ -484,13 +466,12 @@ export default async function handler(req, res) {
       hourP = { kan: hs, shi: hb };
     }
 
-    // ---- Phase D: 蔵干（支→蔵干表）付与 ----
+    // ---- 蔵干付与 ----
     const yearZ = ZOKAN_TABLE[yearP.shi] || [];
     const monthZ = ZOKAN_TABLE[monthP.shi] || [];
     const dayZ = ZOKAN_TABLE[dayP.shi] || [];
     const hourZ = hourP ? (ZOKAN_TABLE[hourP.shi] || []) : [];
 
-    // ---- Phase D: 通変星（十神）・蔵干十神 ----
     const tenDeityTop = {
       year: tenDeity(dayP.kan, yearP.kan),
       month: tenDeity(dayP.kan, monthP.kan),
@@ -505,7 +486,6 @@ export default async function handler(req, res) {
       hour: hourP ? hourZ.map(stem => ({ stem, deity: tenDeity(dayP.kan, stem) })) : []
     };
 
-    // ---- pillars 構築 ----
     const pillars = {
       year: { kan: yearP.kan, shi: yearP.shi, zokan: yearZ, rule: "sekki_risshun" },
       month: { kan: monthP.kan, shi: monthP.shi, zokan: monthZ, rule: "sekki_12jie" },
@@ -513,23 +493,29 @@ export default async function handler(req, res) {
       hour: hourP ? { kan: hourP.kan, shi: hourP.shi, zokan: hourZ, rule: "hour_by_used_time" } : null
     };
 
-    // ---- Phase D: 五行カウント ----
     const fiveCounts = countFiveElementsFromPillars(pillars);
 
-    // ---- Phase D: 大運/年運 ----
+    // ---- Phase D/D+: 大運/年運 ----
     const direction = calcDirection(yearP.kan, sex);
-    const luck = { direction: direction || null };
 
     let dayun = null;
     let nenun = null;
     let current = null;
+
     let startAgeYears = null;
+    let startAgeDetail = null;
     let startCalcMode = null;
+    let startDiffMinutes = null;
 
     if (direction) {
       const targetJie = findNearestJieForStart(usedUtc, direction);
-      startAgeYears = calcStartAgeYearsByJieDiff(usedUtc, targetJie);
-      startCalcMode = "jie_diff_days_div3";
+
+      // ★Phase D+：分単位の起運
+      const start = calcStartAgeByJieDiffMinutes(usedUtc, targetJie);
+      startAgeYears = start.yearsRounded1;
+      startAgeDetail = start.detail;
+      startDiffMinutes = start.diffMinutes;
+      startCalcMode = "jie_diff_minutes_div(3days)";
 
       dayun = buildDayun(
         { kan: monthP.kan, shi: monthP.shi },
@@ -539,15 +525,13 @@ export default async function handler(req, res) {
         dayP.kan
       );
 
-      // 「現在」の判定日（asOfDateがあればそれ、なければサーバー当日）
       const asOfUtc = (asOfDate && typeof asOfDate === "string" && asOfDate.includes("-"))
         ? parseAsOfDateJstToUtc(asOfDate)
         : new Date();
 
       const nenunYear = getNenunYearByRisshun(asOfUtc);
-      nenun = buildNenunList(nenunYear, 6, dayP.kan); // 前後6年=13年
+      nenun = buildNenunList(nenunYear, 6, dayP.kan);
 
-      // current index
       const ageYears = calcAgeYearsAtAsOf({ Y, M, D }, asOfUtc);
       const currentDayunIndex = pickCurrentDayunIndex(dayun, ageYears);
       const currentNenunIndex = nenun.findIndex(x => x.pillarYear === nenunYear);
@@ -561,23 +545,15 @@ export default async function handler(req, res) {
       };
     }
 
-    luck.startCalcMode = startCalcMode;
-    luck.startAgeYears = startAgeYears;
-    luck.dayun = dayun;
-    luck.nenun = nenun;
-    luck.current = current;
-
-    // 現在運を取り出し（AIに渡しやすい形）
     const currentNenun =
-      (luck?.nenun && luck?.current?.currentNenunIndex >= 0)
-        ? luck.nenun[luck.current.currentNenunIndex]
+      (nenun && current?.currentNenunIndex >= 0)
+        ? nenun[current.currentNenunIndex]
         : null;
     const currentDayun =
-      (luck?.dayun && luck?.current?.currentDayunIndex >= 0)
-        ? luck.dayun[luck.current.currentDayunIndex]
+      (dayun && current?.currentDayunIndex >= 0)
+        ? dayun[current.currentDayunIndex]
         : null;
 
-    // ---- meta ----
     const meta = {
       standard: { y: Y, m: M, d: D, time: stdHHMM || "" },
       used: {
@@ -602,7 +578,6 @@ export default async function handler(req, res) {
       };
     }
 
-    // ---- result ----
     const result = {
       ok: true,
       input: {
@@ -624,12 +599,14 @@ export default async function handler(req, res) {
           note: "Counted from stems: year/month/day/hour + all hidden stems (zokan)."
         },
         luck: {
-          direction: luck.direction || null,
-          startCalcMode: luck.startCalcMode || null,
-          startAgeYears: (luck.startAgeYears ?? null),
-          current: luck.current || null,
-          dayun: luck.dayun || null,
-          nenun: luck.nenun || null,
+          direction: direction || null,
+          startCalcMode: startCalcMode || null,
+          startDiffMinutes: startDiffMinutes ?? null,
+          startAgeYears: startAgeYears ?? null,
+          startAgeDetail: startAgeDetail ?? null, // ★追加（UI表示・AI説明にも使える）
+          current: current || null,
+          dayun: dayun || null,
+          nenun: nenun || null,
           currentNenun: currentNenun || null,
           currentDayun: currentDayun || null
         }
