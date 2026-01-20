@@ -96,7 +96,7 @@ export default async function handler(req, res) {
     // ✅ 現在の節（12節）＝月柱判定に使う境界（直近の節）
     const monthBoundary = getCurrentSekkiBoundary(used, precision, tieBreak);
 
-    // ✅ monthBoundaryCheck（デバッグ用：前後節も含む）
+    // ✅ monthBoundaryCheck（デバッグ用：前後節も含む + diff追加）
     const monthBoundaryCheck = buildMonthBoundaryCheck({
       std,
       used,
@@ -224,7 +224,7 @@ export default async function handler(req, res) {
               : {}),
           },
 
-          // ✅ 追加：月柱境界チェック（直前直後判定＋前後節）
+          // ✅ 追加：月柱境界チェック（直前直後判定＋前後節＋diff）
           monthBoundaryCheck: monthBoundaryCheck,
         },
         place: {
@@ -680,7 +680,18 @@ function boundaryTimeYearGuess(boundary, add) {
   return (Number.isFinite(y) ? y : 2000) + add;
 }
 
-// ✅ 追加：monthBoundaryCheck の構築
+function buildDiffObject(secSigned) {
+  const label = secSigned === 0 ? "境界同刻" : (secSigned > 0 ? "直後(+)" : "直前(-)");
+  return {
+    seconds: secSigned,
+    minutes: round2(secSigned / 60),
+    days: round6(secSigned / 86400),
+    label,
+  };
+}
+function round6(x) { return Math.round(x * 1_000_000) / 1_000_000; }
+
+// ✅ 追加：monthBoundaryCheck の構築（diff追加）
 function buildMonthBoundaryCheck({ std, used, precision, tieBreak, boundary }) {
   const stdSec = toJstSeconds(std);
   const usedSec = toJstSeconds(used);
@@ -690,6 +701,9 @@ function buildMonthBoundaryCheck({ std, used, precision, tieBreak, boundary }) {
   const usedIsBeforeMonthBoundary = isBeforeBoundary(usedSec, bSec, tieBreak);
 
   const pn = getPrevNextSekki(boundary, precision);
+
+  const diffStd = stdSec - bSec;
+  const diffUsed = usedSec - bSec;
 
   return {
     standardIsBeforeMonthBoundary,
@@ -711,6 +725,10 @@ function buildMonthBoundaryCheck({ std, used, precision, tieBreak, boundary }) {
       angle: pn.next.angle,
       timeJst: pn.next.timeJst,
       ...(precision === "second" ? { timeJstSec: pn.next.timeJstSec } : {}),
+    },
+    diff: {
+      standard: buildDiffObject(diffStd),
+      used: buildDiffObject(diffUsed),
     },
   };
 }
