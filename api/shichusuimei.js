@@ -6,15 +6,20 @@
 // Phase D: 「大運/年運」+ 年運は立春境界で切る精密版
 // Phase D+: 起運年齢を“分単位”で厳密計算（節までの差分Minutes ÷ (3日換算)）
 //
-// ★追加（節入り境界精密化: Phase A++）
+// ★節入り境界 精密化（Phase A++）
 // - boundaryTimeRef: "used" | "standard"
 //   年柱（立春）境界判定を「補正後 usedUtc」か「補正前 stdUtc」どちらで行うかを選べる。
 //   デフォルト "used"（現状維持）。
 // - sekkiBoundaryPrecision: "second" | "minute"
-//   節入り境界比較の粒度。minute は分丸め比較で“表示(分)と判定(秒)”のズレを防ぐ。
+//   節入り境界比較の粒度。
 // - sekkiBoundaryTieBreak: "after" | "before"
-//   境界ちょうど(同一と見なした)場合に「節入り後」扱いするか。
+//   境界ちょうど(同一と見なした)場合の扱い。
 //   "after" 推奨（境界ちょうど＝切替後）
+//
+// ★今回の追加（バグ防止/検証強化）
+// - yearBoundary に timeJstSec を追加（分表示と判定(秒)のズレを可視化）
+// - 月柱の「節入り判定」にも precision/tieBreak を適用（立春ちょうど等の境界でブレ防止）
+// - sekkiUsed は常に timeJstSec を返す（条件分岐で欠けないように）
 //
 // POST /api/shichusuimei
 // body: {
@@ -55,25 +60,18 @@ const PREF_LONGITUDE = {
 };
 
 // ========== Phase B+ 均時差（Equation of Time / EoT） ==========
-// 返り値：分（+ は「真太陽時が平均太陽時より進む」扱いで加算）
-// 実装は一般的な近似式（NOAA等の近似）で、四柱推命用途の分単位補正としては十分実用。
-// ※将来さらに天文計算を精密化する場合はここを差し替え可能。
+// 返り値：分（真太陽時 = 平均太陽時 + eqTimeMin）
 function equationOfTimeMinutes(dateUtc) {
-  // dateUtc: UTC Date（JST日時をUTCにしたものでもOK）
-  // まず「その日の通日」を求める（UTC基準）
   const y = dateUtc.getUTCFullYear();
   const m = dateUtc.getUTCMonth() + 1;
   const d = dateUtc.getUTCDate();
 
-  // day of year
   const start = Date.UTC(y, 0, 1);
   const today = Date.UTC(y, m - 1, d);
   const n = Math.floor((today - start) / (24 * 3600 * 1000)) + 1;
 
-  // fractional year (radians) - 12:00を仮定（分単位EoTには十分）
   const gamma = (2 * Math.PI / 365) * (n - 1 + (12 - 12) / 24);
 
-  // EoT in minutes (NOAA approximation)
   const eot =
     229.18 * (
       0.000075
@@ -83,9 +81,6 @@ function equationOfTimeMinutes(dateUtc) {
       - 0.040849 * Math.sin(2 * gamma)
     );
 
-  // NOAAの式は「見かけ太陽時 − 平均太陽時」の符号系が混在しがちなので、
-  // このプロジェクトでは「真太陽時 = 平均太陽時 + eqTimeMin」として統一。
-  // そのため eot をそのまま eqTimeMin として加算します。
   return eot;
 }
 
@@ -150,7 +145,7 @@ function calcDayPillarWithBoundary({ Y, M, D, hh, mm, dayBoundaryMode }) {
   return calcDayPillarSimpleByYMD(y, m, d);
 }
 
-// ---- 時柱（真太陽時補正後の時刻で判定） ----
+// ---- 時柱（補正後の時刻で判定） ----
 function hourBranchFromTime(hh, mm) {
   const minutes = hh * 60 + mm;
   if (minutes >= 23 * 60) return "子";
@@ -167,36 +162,6 @@ function hourStemFromDayStemAndHourBranch(dayStem, hourBranch) {
   const ziIndex = STEMS.indexOf(ziStem);
   const hbIndex = BRANCHES.indexOf(hourBranch);
   return STEMS[(ziIndex + hbIndex) % 10];
-}
-
-// ---- 月柱：節入り（12節）で境界 ----
-function calcMonthPillarByJie(dateUtcForJst, yearPillarStem) {
-  const yJst = new Date(dateUtcForJst.getTime() + 9 * 3600 * 1000).getUTCFullYear();
-  const jiePrev = buildJie12Utc(yJst - 1);
-  const jieThis = buildJie12Utc(yJst);
-  const jieNext = buildJie12Utc(yJst + 1);
-  const all = [...jiePrev, ...jieThis, ...jieNext].sort((a, b) => a.timeUtc.getTime() - b.timeUtc.getTime());
-
-  let latest = null;
-  for (const j of all) {
-    if (j.timeUtc.getTime() <= dateUtcForJst.getTime()) latest = j;
-    else break;
-  }
-  if (!latest) latest = all[0];
-
-  const angleOrder = [315,345,15,45,75,105,135,165,195,225,255,285];
-  const idx = angleOrder.indexOf(latest.angle);
-  const monthIndex = idx >= 0 ? idx : 0;
-
-  const monthBranch = MONTH_BRANCHES[monthIndex];
-  const firstStem = tigerMonthStemForYearStem(yearPillarStem);
-  const monthStem = addStem(firstStem, monthIndex);
-
-  return {
-    kan: monthStem,
-    shi: monthBranch,
-    sekkiUsed: { name: latest.name, angle: latest.angle, timeJst: formatJst(latest.timeUtc) }
-  };
 }
 
 // ---- 入力処理 ----
@@ -216,7 +181,6 @@ function fmtHHMM(hh, mm) { return `${pad2(hh)}:${pad2(mm)}`; }
 
 // ---- Phase A++: 秒表示/境界比較ユーティリティ ----
 function formatJstSec(dateUtc) {
-  // dateUtc(UTC) -> "YYYY-MM-DD HH:MM:SS" (JST)
   const d = new Date(dateUtc.getTime() + 9 * 3600 * 1000);
   const Y = d.getUTCFullYear();
   const M = pad2(d.getUTCMonth() + 1);
@@ -229,7 +193,7 @@ function formatJstSec(dateUtc) {
 function toPrecisionTs(dateUtc, precision) {
   const t = dateUtc.getTime();
   if (precision === "minute") return Math.floor(t / 60000) * 60000; // truncate to minute
-  return t; // "second" (keep ms)
+  return t; // "second"
 }
 function compareWithTie(aUtc, bUtc, precision, tieBreak) {
   const a = toPrecisionTs(aUtc, precision);
@@ -237,8 +201,53 @@ function compareWithTie(aUtc, bUtc, precision, tieBreak) {
   if (a < b) return -1;
   if (a > b) return 1;
   // tie
-  // "after" => not before (treat as a is after-or-equal)
-  return tieBreak === "before" ? -1 : 1;
+  return tieBreak === "before" ? -1 : 1; // after => treat as "not before"
+}
+
+// ---- 月柱：節入り（12節）で境界（precision/tieBreak対応） ----
+function calcMonthPillarByJie(dateUtcForJst, yearPillarStem, precision, tieBreak) {
+  const yJst = new Date(dateUtcForJst.getTime() + 9 * 3600 * 1000).getUTCFullYear();
+  const jiePrev = buildJie12Utc(yJst - 1);
+  const jieThis = buildJie12Utc(yJst);
+  const jieNext = buildJie12Utc(yJst + 1);
+  const all = [...jiePrev, ...jieThis, ...jieNext].sort((a, b) => a.timeUtc.getTime() - b.timeUtc.getTime());
+
+  // latest: j.timeUtc <= dateUtc (with precision/tieBreak)
+  let latest = null;
+  for (const j of all) {
+    const cmp = compareWithTie(j.timeUtc, dateUtcForJst, precision, tieBreak);
+    // cmp === 1 means j >= date (or tie treated as after) when comparing j vs date.
+    // we need j <= date : that is NOT (j > date). simplest:
+    if (j.timeUtc.getTime() <= dateUtcForJst.getTime()) {
+      // keep tentative, but handle tie policy by using compareWithTie(date, j)
+      const isAfter = compareWithTie(dateUtcForJst, j.timeUtc, precision, tieBreak) !== -1;
+      if (isAfter) latest = j;
+      continue;
+    } else {
+      // j is strictly after by ms; cannot be latest
+      break;
+    }
+  }
+  if (!latest) latest = all[0];
+
+  const angleOrder = [315,345,15,45,75,105,135,165,195,225,255,285];
+  const idx = angleOrder.indexOf(latest.angle);
+  const monthIndex = idx >= 0 ? idx : 0;
+
+  const monthBranch = MONTH_BRANCHES[monthIndex];
+  const firstStem = tigerMonthStemForYearStem(yearPillarStem);
+  const monthStem = addStem(firstStem, monthIndex);
+
+  return {
+    kan: monthStem,
+    shi: monthBranch,
+    sekkiUsed: {
+      name: latest.name,
+      angle: latest.angle,
+      timeJst: formatJst(latest.timeUtc),
+      timeJstSec: formatJstSec(latest.timeUtc)
+    }
+  };
 }
 
 // ---- 十神（通変星） ----
@@ -447,11 +456,10 @@ export default async function handler(req, res) {
     const dayBoundaryMode = body?.dayBoundaryMode ?? "24";
     const asOfDate = body?.asOfDate ?? null;
 
-    // ★追加：年柱(立春)境界判定に使う時刻参照
-    // "used" (補正後 usedUtc) / "standard" (補正前 stdUtc)
+    // ★年柱(立春)境界判定に使う時刻参照
     const boundaryTimeRef = body?.boundaryTimeRef ?? "used";
 
-    // ★追加：節入り境界 精密化
+    // ★節入り境界 精密化
     const sekkiBoundaryPrecision = body?.sekkiBoundaryPrecision ?? "second"; // "second" | "minute"
     const sekkiBoundaryTieBreak = body?.sekkiBoundaryTieBreak ?? "after";     // "after" | "before"
 
@@ -491,8 +499,6 @@ export default async function handler(req, res) {
 
         // 均時差（真太陽時）
         if (wantsTrueSolar) {
-          // EoTは「その日付」の値でOK（分単位補正）
-          // ※ usedUtc の日付（UTC）で計算しても、実用上は十分一致します
           eqTimeMin = equationOfTimeMinutes(usedUtc);
           usedUtc = new Date(usedUtc.getTime() + eqTimeMin * 60 * 1000);
         }
@@ -509,21 +515,24 @@ export default async function handler(req, res) {
     const jieThis = buildJie12Utc(Y);
     const risshun = jieThis.find(j => j.angle === 315) || null;
 
-    // ★追加：境界判定に使う基準時刻
+    // 境界判定に使う基準時刻
     const boundaryUtc = (boundaryTimeRef === "standard") ? stdUtc : usedUtc;
 
     let yearForPillar = Y;
     if (risshun) {
-      // 精密化：precision/tieBreak を反映
-      // compareWithTie(boundary, risshun) === -1 => boundary is before risshun
       const cmp = compareWithTie(boundaryUtc, risshun.timeUtc, sekkiBoundaryPrecision, sekkiBoundaryTieBreak);
-      if (cmp === -1) {
-        yearForPillar = Y - 1;
-      }
+      if (cmp === -1) yearForPillar = Y - 1;
     }
 
     const yearP = calcYearPillarByRisshun(yearForPillar);
-    const monthP = calcMonthPillarByJie(usedUtc, yearP.kan);
+
+    // ★月柱も precision/tieBreak を適用
+    const monthP = calcMonthPillarByJie(
+      usedUtc,
+      yearP.kan,
+      sekkiBoundaryPrecision,
+      sekkiBoundaryTieBreak
+    );
 
     // ---- Phase C: 日柱（23/24切替）----
     const dayP = calcDayPillarWithBoundary({ Y, M, D, hh: usedHH, mm: usedMM, dayBoundaryMode });
@@ -636,7 +645,9 @@ export default async function handler(req, res) {
         sekkiBoundaryPrecisionUsed: sekkiBoundaryPrecision,
         sekkiBoundaryTieBreakUsed: sekkiBoundaryTieBreak,
         sekkiUsed: monthP.sekkiUsed,
-        yearBoundary: risshun ? { name: "立春", timeJst: formatJst(risshun.timeUtc) } : null,
+        yearBoundary: risshun
+          ? { name: "立春", timeJst: formatJst(risshun.timeUtc), timeJstSec: formatJstSec(risshun.timeUtc) }
+          : null,
         yearPillarYearUsed: yearForPillar
       },
       place: birthPlace ? { ...birthPlace } : null
@@ -651,7 +662,7 @@ export default async function handler(req, res) {
       };
     }
 
-    // ★追加：検証用（標準/補正後のどちらが立春前かを併記 + 秒表示）
+    // ★検証用（標準/補正後のどちらが立春前かを併記 + 秒表示）
     if (risshun) {
       meta.used.yearBoundaryCheck = {
         standardIsBeforeRisshun: compareWithTie(stdUtc, risshun.timeUtc, sekkiBoundaryPrecision, sekkiBoundaryTieBreak) === -1,
@@ -662,11 +673,6 @@ export default async function handler(req, res) {
         usedTimeJstSec: formatJstSec(usedUtc),
         risshunTimeJstSec: formatJstSec(risshun.timeUtc)
       };
-    }
-
-    // sekkiUsed(=月柱境界に使った節) も秒表示を追加（立春のとき分表示と判定ズレが起きやすい）
-    if (meta.used?.sekkiUsed?.timeJst && risshun && meta.used.sekkiUsed.name === "立春") {
-      meta.used.sekkiUsed.timeJstSec = formatJstSec(risshun.timeUtc);
     }
 
     const result = {
