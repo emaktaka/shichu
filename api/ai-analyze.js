@@ -39,20 +39,42 @@ export default async function handler(req, res) {
       throw new Error("Invalid result: result.ok is false");
     }
 
-    const prompt = buildJapanesePrompt(result);
-
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) throw new Error("OPENAI_API_KEY is missing");
 
     const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
     const temperature = clampNumber(process.env.OPENAI_TEMPERATURE, 0.6, 0, 1.5);
 
-    const text = await callOpenAIText({
+    // 1st prompt
+    const prompt1 = buildJapanesePrompt(result);
+
+    let text = await callOpenAIText({
       apiKey,
       model,
       temperature,
-      prompt,
+      prompt: prompt1,
     });
+
+    // ✅ 安全弁：節入り境界（年/月）の章が薄い/消える事故を防ぐ（1回だけ再生成）
+    // 目安: 「節入り境界」 or 「境界」 or monthBoundary/立春の話題が本文に見当たらない場合
+    if (!looksLikeBoundaryIncluded(text)) {
+      const prompt2 = `${prompt1}
+
+---
+
+【追加指示（必須）】
+- 本文の「2. 節入り境界の読み」で、年（立春）と月（直近の節）の両方について、
+  “境界生まれ/境界直前直後”の意味を必ず具体的に説明してください。
+- monthBoundaryCheck に prevBoundary/nextBoundary がある場合、前後の節名も文章に含めてください。
+- それ以外の構成順は変えないでください。`.trim();
+
+      text = await callOpenAIText({
+        apiKey,
+        model,
+        temperature,
+        prompt: prompt2,
+      });
+    }
 
     res.statusCode = 200;
     return res.end(JSON.stringify({ ok: true, text }));
@@ -138,6 +160,8 @@ function buildJapanesePrompt(result) {
         monthBoundary: used.monthBoundary || null,
         yearBoundary: used.yearBoundary || null,
         yearPillarYearUsed: used.yearPillarYearUsed,
+        yearBoundaryCheck: used.yearBoundaryCheck || null,
+        monthBoundaryCheck: used.monthBoundaryCheck || null,
       },
       place: {
         pref: place.pref,
@@ -220,7 +244,12 @@ function buildMonthBoundaryNarrative({ boundary, check, tieBreak, precision }) {
   if (!boundary || !check) return `月の節境界情報は取得できませんでした。`;
 
   const bName = check.boundaryName || boundary.name || "（不明）";
-  const bTime = check.boundaryTimeJstSec || check.boundaryTimeJst || boundary.timeJstSec || boundary.timeJst || "（不明）";
+  const bTime =
+    check.boundaryTimeJstSec ||
+    check.boundaryTimeJst ||
+    boundary.timeJstSec ||
+    boundary.timeJst ||
+    "（不明）";
 
   const sBefore = check.standardIsBeforeMonthBoundary;
   const uBefore = check.usedIsBeforeMonthBoundary;
@@ -238,15 +267,33 @@ function buildMonthBoundaryNarrative({ boundary, check, tieBreak, precision }) {
 
   const around = [prev, next].filter(Boolean).join(" / ");
 
+  // diffがあれば、AIが「境界にどれだけ近いか」を説明しやすい
+  const diffStd = check?.diff?.standard?.label ? `標準時は境界の${check.diff.standard.label}（${check.diff.standard.minutes}分差）` : "";
+  const diffUsed = check?.diff?.used?.label ? `補正後は境界の${check.diff.used.label}（${check.diff.used.minutes}分差）` : "";
+  const diffNote = [diffStd, diffUsed].filter(Boolean).join(" / ");
+
   return `月の節境界は「${bName}（${bTime}）」です。標準時(${stdT})は境界の${
     sBefore ? "前" : "後"
   }、補正後(${usedT})も境界の${uBefore ? "前" : "後"}判定です。${
     around ? `（${around}）` : ""
-  }${tieNote}`.trim();
+  }${diffNote ? `（${diffNote}）` : ""}${tieNote}`.trim();
 }
 
 function pad2(n) {
   return String(n).padStart(2, "0");
+}
+
+function looksLikeBoundaryIncluded(text) {
+  if (!text || typeof text !== "string") return false;
+  const s = text;
+  // ざっくり検知（強すぎる縛りは避ける）
+  return (
+    s.includes("節入り境界") ||
+    s.includes("境界") ||
+    s.includes("立春") ||
+    s.includes("直前") ||
+    s.includes("直後")
+  );
 }
 
 // ------------------------------
