@@ -2,19 +2,23 @@
  * Vercel Serverless Function (ESM)
  * /api/shichusuimei
  *
- * ✅ Phase B+ (Sekki boundary precision)
+ * ✅ Phase B+ (Sekki boundary precision) + タイムアウト対策（メモ化）
  * - timeMode: standard | mean_solar | true_solar
- * - true_solar adds eqTimeMin (equation of time) and MUST return meta.place.eqTimeMin
- * - sekkiBoundaryPrecision: minute | second (default: minute)
- * - sekkiBoundaryTieBreak: after | before (default: after)
- * - boundaryTimeRef: standard | used (default: used)
- * - dayBoundaryMode: 24 | 23 (default: 24)
+ * - true_solar => meta.place.eqTimeMin を返す
+ * - sekkiBoundaryPrecision: minute | second
+ * - sekkiBoundaryTieBreak: after | before
+ * - boundaryTimeRef: standard | used
+ * - dayBoundaryMode: 24 | 23
  *
- * ⚠️ 追加ミス対策:
- * - 依存0（このファイル単体で動く）
- * - すべて防御的にパース／デフォルト付与
- * - 例外は必ず { ok:false, error } で返す
+ * ✅ 重要:
+ * - package.json が "type":"module" のため ESM（export default）で統一
+ * - 追加ミス防止: 防御的パース + 例外は必ず {ok:false,error} で返す
  */
+
+// ------------------------------
+// Request-scope cache (memoization)
+// ------------------------------
+const TERM_CACHE = new Map(); // key: `${year}|${angle}|${precision}` -> result
 
 export default async function handler(req, res) {
   try {
@@ -33,7 +37,9 @@ export default async function handler(req, res) {
       return res.end(JSON.stringify({ ok: false, error: "Method Not Allowed" }));
     }
 
-    const body = await readJsonBody(req);
+    // ✅ Next.js API Route互換: req.body が既にパース済みならそれを使う（速い）
+    const body =
+      req.body && typeof req.body === "object" ? req.body : await readJsonBody(req);
 
     // ---- Input parse & defaults ----
     const input = normalizeInput(body);
@@ -52,42 +58,70 @@ export default async function handler(req, res) {
 
     // ---- used time (standard + corrections) ----
     const eqTimeMin = computeEquationOfTimeMinutes(std.dateObjUtc); // minutes
-    const used = computeUsedDateTimeJst(std, input.timeMode, place.lonCorrectionMin, eqTimeMin);
+    const used = computeUsedDateTimeJst(
+      std,
+      input.timeMode,
+      place.lonCorrectionMin,
+      eqTimeMin
+    );
 
-    // ---- Sekki boundary precision ----
     const precision = input.sekkiBoundaryPrecision; // "minute" | "second"
     const tieBreak = input.sekkiBoundaryTieBreak; // "after" | "before"
 
-    // ---- Compute Risshun time for boundary year check (angle 315) ----
-    const risshunThisYear = findSolarTermTimeJst(used.y, 315, precision);
+    // ---- Risshun time (angle 315) ----
+    const risshunThisYear = getSolarTermCached(used.y, 315, precision);
 
     const stdJstSec = toJstSeconds(std);
     const usedJstSec = toJstSeconds(used);
 
-    // standard before/after risshun?
-    const stdIsBeforeRisshun = isBeforeBoundary(stdJstSec, risshunThisYear.secJst, tieBreak);
-    // used before/after risshun?
-    const usedIsBeforeRisshun = isBeforeBoundary(usedJstSec, risshunThisYear.secJst, tieBreak);
+    const stdIsBeforeRisshun = isBeforeBoundary(
+      stdJstSec,
+      risshunThisYear.secJst,
+      tieBreak
+    );
+    const usedIsBeforeRisshun = isBeforeBoundary(
+      usedJstSec,
+      risshunThisYear.secJst,
+      tieBreak
+    );
 
-    const yearPillarYearUsed = usedIsBeforeRisshun ? (used.y - 1) : used.y;
-    const yearBoundary = risshunThisYear;
+    const yearPillarYearUsed = usedIsBeforeRisshun ? used.y - 1 : used.y;
 
-    // ---- Determine current sekki used (12 "節" boundaries) ----
     const sekkiUsed = getCurrentSekkiBoundary(used, precision, tieBreak);
 
     // ---- Pillars ----
     const yearPillar = calcYearPillar(yearPillarYearUsed);
     const monthPillar = calcMonthPillar(used, yearPillar.kan, precision, tieBreak);
-    const dayPillar = calcDayPillar(std, used, input.dayBoundaryMode, input.boundaryTimeRef);
+    const dayPillar = calcDayPillar(
+      std,
+      used,
+      input.dayBoundaryMode,
+      input.boundaryTimeRef
+    );
     const hourPillar = calcHourPillar(used, dayPillar.kan, input.time);
 
     // ---- Derived ----
-    const tenDeity = calcTenDeity(yearPillar.kan, monthPillar.kan, dayPillar.kan, hourPillar?.kan);
-    const zokanTenDeity = calcZokanTenDeity(yearPillar.shi, monthPillar.shi, dayPillar.shi, hourPillar?.shi, dayPillar.kan);
+    const tenDeity = calcTenDeity(
+      yearPillar.kan,
+      monthPillar.kan,
+      dayPillar.kan,
+      hourPillar?.kan
+    );
+    const zokanTenDeity = calcZokanTenDeity(
+      yearPillar.shi,
+      monthPillar.shi,
+      dayPillar.shi,
+      hourPillar?.shi,
+      dayPillar.kan
+    );
 
     const fiveElements = calcFiveElementsCounts(
-      [yearPillar.kan, monthPillar.kan, dayPillar.kan].concat(hourPillar?.kan ? [hourPillar.kan] : []),
-      [yearPillar.shi, monthPillar.shi, dayPillar.shi].concat(hourPillar?.shi ? [hourPillar.shi] : [])
+      [yearPillar.kan, monthPillar.kan, dayPillar.kan].concat(
+        hourPillar?.kan ? [hourPillar.kan] : []
+      ),
+      [yearPillar.shi, monthPillar.shi, dayPillar.shi].concat(
+        hourPillar?.shi ? [hourPillar.shi] : []
+      )
     );
 
     const luck = calcLuckAll({
@@ -134,20 +168,31 @@ export default async function handler(req, res) {
           },
           yearBoundary: {
             name: "立春",
-            timeJst: yearBoundary.timeJst,
-            ...(precision === "second" ? { timeJstSec: yearBoundary.timeJstSec } : {}),
+            timeJst: risshunThisYear.timeJst,
+            ...(precision === "second" ? { timeJstSec: risshunThisYear.timeJstSec } : {}),
           },
           yearPillarYearUsed,
           yearBoundaryCheck: {
-            standardIsBeforeRisshun,
-            usedIsBeforeRisshun,
-            standardTimeJst: `${std.y}-${pad2(std.m)}-${pad2(std.d)} ${formatHM(std.hh, std.mm)}`,
-            usedTimeJst: `${used.y}-${pad2(used.m)}-${pad2(used.d)} ${formatHM(used.hh, used.mm)}`,
+            // ✅ ここが修正点：standardIsBeforeRisshun → stdIsBeforeRisshun
+            standardIsBeforeRisshun: stdIsBeforeRisshun,
+            usedIsBeforeRisshun: usedIsBeforeRisshun,
+            standardTimeJst: `${std.y}-${pad2(std.m)}-${pad2(std.d)} ${formatHM(
+              std.hh,
+              std.mm
+            )}`,
+            usedTimeJst: `${used.y}-${pad2(used.m)}-${pad2(used.d)} ${formatHM(
+              used.hh,
+              used.mm
+            )}`,
             ...(precision === "second"
               ? {
-                  standardTimeJstSec: `${std.y}-${pad2(std.m)}-${pad2(std.d)} ${formatHMS(std.hh, std.mm, std.ss)}`,
-                  usedTimeJstSec: `${used.y}-${pad2(used.m)}-${pad2(used.d)} ${formatHMS(used.hh, used.mm, used.ss)}`,
-                  risshunTimeJstSec: yearBoundary.timeJstSec,
+                  standardTimeJstSec: `${std.y}-${pad2(std.m)}-${pad2(
+                    std.d
+                  )} ${formatHMS(std.hh, std.mm, std.ss)}`,
+                  usedTimeJstSec: `${used.y}-${pad2(used.m)}-${pad2(
+                    used.d
+                  )} ${formatHMS(used.hh, used.mm, used.ss)}`,
+                  risshunTimeJstSec: risshunThisYear.timeJstSec,
                 }
               : {}),
           },
@@ -201,6 +246,9 @@ export default async function handler(req, res) {
   } catch (e) {
     res.statusCode = 200;
     return res.end(JSON.stringify({ ok: false, error: String(e?.message || e) }));
+  } finally {
+    // request-scope的に見せたいので毎回クリア（※Vercelのwarmで残ることがある）
+    TERM_CACHE.clear();
   }
 }
 
@@ -397,8 +445,18 @@ function toJulianDay(dateUtc) {
 }
 
 // ------------------------------
-// Solar term time finder (binary search)
+// Solar term time finder + MEMOIZED wrapper
 // ------------------------------
+function getSolarTermCached(year, targetAngleDeg, precision) {
+  const key = `${year}|${targetAngleDeg}|${precision}`;
+  const hit = TERM_CACHE.get(key);
+  if (hit) return hit;
+
+  const val = findSolarTermTimeJst(year, targetAngleDeg, precision);
+  TERM_CACHE.set(key, val);
+  return val;
+}
+
 function findSolarTermTimeJst(year, targetAngleDeg, precision) {
   const guess = guessSolarTermDateJst(year, targetAngleDeg);
 
@@ -503,26 +561,28 @@ function guessSolarTermDateJst(year, angle) {
 // ------------------------------
 // Sekki current (12節 boundaries)
 // ------------------------------
-function getCurrentSekkiBoundary(used, precision, tieBreak) {
-  const boundaries = [
-    { angle: 315, name: "立春" },
-    { angle: 345, name: "啓蟄" },
-    { angle: 15,  name: "清明" },
-    { angle: 45,  name: "立夏" },
-    { angle: 75,  name: "芒種" },
-    { angle: 105, name: "小暑" },
-    { angle: 135, name: "立秋" },
-    { angle: 165, name: "白露" },
-    { angle: 195, name: "寒露" },
-    { angle: 225, name: "立冬" },
-    { angle: 255, name: "大雪" },
-    { angle: 285, name: "小寒" },
-  ];
+const SEKKI_12 = [
+  { angle: 315, name: "立春" },
+  { angle: 345, name: "啓蟄" },
+  { angle: 15,  name: "清明" },
+  { angle: 45,  name: "立夏" },
+  { angle: 75,  name: "芒種" },
+  { angle: 105, name: "小暑" },
+  { angle: 135, name: "立秋" },
+  { angle: 165, name: "白露" },
+  { angle: 195, name: "寒露" },
+  { angle: 225, name: "立冬" },
+  { angle: 255, name: "大雪" },
+  { angle: 285, name: "小寒" },
+];
 
+function getCurrentSekkiBoundary(used, precision, tieBreak) {
   const cand = [];
-  for (const b of boundaries) {
-    cand.push({ ...b, ...findSolarTermTimeJst(used.y, b.angle, precision) });
-    cand.push({ ...b, ...findSolarTermTimeJst(used.y - 1, b.angle, precision) });
+  for (const b of SEKKI_12) {
+    const a = getSolarTermCached(used.y, b.angle, precision);
+    const b1 = getSolarTermCached(used.y - 1, b.angle, precision);
+    cand.push({ ...b, ...a });
+    cand.push({ ...b, ...b1 });
   }
 
   const usedSec = toJstSeconds(used);
@@ -535,7 +595,7 @@ function getCurrentSekkiBoundary(used, precision, tieBreak) {
   }
 
   if (!best) {
-    const fb = findSolarTermTimeJst(used.y - 1, 285, precision);
+    const fb = getSolarTermCached(used.y - 1, 285, precision);
     best = { angle: 285, name: "小寒", ...fb };
   }
 
@@ -602,7 +662,7 @@ function calcDayPillar(std, used, dayBoundaryMode, boundaryTimeRef) {
   }
 
   const jdn = julianDayNumber(y, m, d);
-  const idx = mod(jdn + 47, 60); // calibration to match your sample (1990-02-04 => 戊戌)
+  const idx = mod(jdn + 47, 60); // calibration: 1990-02-04 => 戊戌（あなたの検証に合わせ）
   return sexagenaryFromIndex(idx);
 }
 
@@ -800,26 +860,12 @@ function calcLuckDirection(sex, yearStem) {
 }
 
 function calcStartDiffMinutesToJie(used, direction, precision, tieBreak) {
-  const boundaries = [
-    { angle: 315, name: "立春" },
-    { angle: 345, name: "啓蟄" },
-    { angle: 15,  name: "清明" },
-    { angle: 45,  name: "立夏" },
-    { angle: 75,  name: "芒種" },
-    { angle: 105, name: "小暑" },
-    { angle: 135, name: "立秋" },
-    { angle: 165, name: "白露" },
-    { angle: 195, name: "寒露" },
-    { angle: 225, name: "立冬" },
-    { angle: 255, name: "大雪" },
-    { angle: 285, name: "小寒" },
-  ];
-
   const cand = [];
-  for (const b of boundaries) {
-    cand.push({ ...b, ...findSolarTermTimeJst(used.y - 1, b.angle, precision) });
-    cand.push({ ...b, ...findSolarTermTimeJst(used.y, b.angle, precision) });
-    cand.push({ ...b, ...findSolarTermTimeJst(used.y + 1, b.angle, precision) });
+  for (const b of SEKKI_12) {
+    const prev = getSolarTermCached(used.y - 1, b.angle, precision);
+    const cur  = getSolarTermCached(used.y, b.angle, precision);
+    const next = getSolarTermCached(used.y + 1, b.angle, precision);
+    cand.push({ ...b, ...prev }, { ...b, ...cur }, { ...b, ...next });
   }
 
   const usedSec = toJstSeconds(used);
@@ -831,7 +877,7 @@ function calcStartDiffMinutesToJie(used, direction, precision, tieBreak) {
       if (!ok) continue;
       if (!best || c.secJst < best.secJst) best = c;
     }
-    if (!best) best = cand.sort((a,b) => a.secJst - b.secJst)[0];
+    if (!best) best = cand.sort((a, b) => a.secJst - b.secJst)[0];
     return (best.secJst - usedSec) / 60;
   } else {
     let best = null;
@@ -840,7 +886,7 @@ function calcStartDiffMinutesToJie(used, direction, precision, tieBreak) {
       if (!ok) continue;
       if (!best || c.secJst > best.secJst) best = c;
     }
-    if (!best) best = cand.sort((a,b) => b.secJst - a.secJst)[0];
+    if (!best) best = cand.sort((a, b) => b.secJst - a.secJst)[0];
     return (usedSec - best.secJst) / 60;
   }
 }
@@ -902,7 +948,7 @@ function findCurrentDayunIndex(dayun, ageYears) {
 }
 
 function calcNenunYearByRisshun(nowJst, precision) {
-  const risshun = findSolarTermTimeJst(nowJst.y, 315, precision);
+  const risshun = getSolarTermCached(nowJst.y, 315, precision);
   const nowUtc = Date.UTC(nowJst.y, nowJst.m - 1, nowJst.d, nowJst.hh - 9, nowJst.mm, nowJst.ss);
   const nowSecJst = Math.floor((nowUtc + 9 * 3600 * 1000) / 1000);
   const before = nowSecJst < risshun.secJst;
