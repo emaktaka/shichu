@@ -3,13 +3,18 @@
  * /api/shichusuimei
  *
  * ✅ Phase B+ (Sekki boundary precision) + タイムアウト対策（メモ化）
- * ✅ Phase C (Month boundary precision) = monthBoundaryCheck を meta.used に追加
  * - timeMode: standard | mean_solar | true_solar
  * - true_solar => meta.place.eqTimeMin を返す
  * - sekkiBoundaryPrecision: minute | second
  * - sekkiBoundaryTieBreak: after | before
  * - boundaryTimeRef: standard | used
  * - dayBoundaryMode: 24 | 23
+ *
+ * ✅ 追加（今回）:
+ * - meta.used.monthBoundary / monthBoundaryCheck を出す
+ *   - 「月の節境界がどれか」
+ *   - その直前直後判定（standard/used の両方）
+ *   - prevBoundary / nextBoundary（前後の節）もデバッグ表示
  *
  * ✅ 重要:
  * - package.json が "type":"module" のため ESM（export default）で統一
@@ -88,34 +93,21 @@ export default async function handler(req, res) {
 
     const yearPillarYearUsed = usedIsBeforeRisshun ? used.y - 1 : used.y;
 
-    // ---- Month boundary around used (prev/current/next) ----
-    const monthBoundaries = getMonthBoundariesAround(used, precision, tieBreak);
-    const monthBoundaryCurrent = monthBoundaries.current;
+    // ✅ 現在の節（12節）＝月柱判定に使う境界（直近の節）
+    const monthBoundary = getCurrentSekkiBoundary(used, precision, tieBreak);
 
-    // ---- Sekki Used (現在有効な節境界として表示) ----
-    const sekkiUsed = {
-      name: monthBoundaryCurrent.name,
-      angle: monthBoundaryCurrent.angle,
-      timeJst: monthBoundaryCurrent.timeJst,
-      timeJstSec: monthBoundaryCurrent.timeJstSec,
-      secJst: monthBoundaryCurrent.secJst,
-    };
-
-    // ---- Month boundary check (debug) ----
-    const stdIsBeforeMonthBoundary = isBeforeBoundary(
-      stdJstSec,
-      monthBoundaryCurrent.secJst,
-      tieBreak
-    );
-    const usedIsBeforeMonthBoundary = isBeforeBoundary(
-      usedJstSec,
-      monthBoundaryCurrent.secJst,
-      tieBreak
-    );
+    // ✅ monthBoundaryCheck（デバッグ用：前後節も含む）
+    const monthBoundaryCheck = buildMonthBoundaryCheck({
+      std,
+      used,
+      precision,
+      tieBreak,
+      boundary: monthBoundary,
+    });
 
     // ---- Pillars ----
     const yearPillar = calcYearPillar(yearPillarYearUsed);
-    const monthPillar = calcMonthPillar(used, yearPillar.kan, precision, tieBreak);
+    const monthPillar = calcMonthPillarFromBoundary(monthBoundary, yearPillar.kan);
     const dayPillar = calcDayPillar(
       std,
       used,
@@ -185,33 +177,29 @@ export default async function handler(req, res) {
           sekkiBoundaryPrecisionUsed: input.sekkiBoundaryPrecision,
           sekkiBoundaryTieBreakUsed: input.sekkiBoundaryTieBreak,
 
-          // 現在有効な節（12節境界）を表示（UI/デバッグ用）
+          // ✅ これが「どの節を採用して月柱を決めたか」
           sekkiUsed: {
-            name: sekkiUsed.name,
-            angle: sekkiUsed.angle,
-            timeJst: sekkiUsed.timeJst,
-            ...(precision === "second" ? { timeJstSec: sekkiUsed.timeJstSec } : {}),
+            name: monthBoundary.name,
+            angle: monthBoundary.angle,
+            timeJst: monthBoundary.timeJst,
+            ...(precision === "second" ? { timeJstSec: monthBoundary.timeJstSec } : {}),
           },
 
-          // ✅ 月柱境界（= 12節のどれを採用したか）を明示
+          // ✅ 追加：月柱境界（デバッグ用に別名でも返す：UI側が見やすい）
           monthBoundary: {
-            name: monthBoundaryCurrent.name,
-            angle: monthBoundaryCurrent.angle,
-            timeJst: monthBoundaryCurrent.timeJst,
-            ...(precision === "second"
-              ? { timeJstSec: monthBoundaryCurrent.timeJstSec }
-              : {}),
+            name: monthBoundary.name,
+            angle: monthBoundary.angle,
+            timeJst: monthBoundary.timeJst,
+            ...(precision === "second" ? { timeJstSec: monthBoundary.timeJstSec } : {}),
           },
 
-          // 年柱境界（立春）
+          // ✅ 年柱境界（立春）
           yearBoundary: {
             name: "立春",
             timeJst: risshunThisYear.timeJst,
             ...(precision === "second" ? { timeJstSec: risshunThisYear.timeJstSec } : {}),
           },
-
           yearPillarYearUsed,
-
           yearBoundaryCheck: {
             standardIsBeforeRisshun: stdIsBeforeRisshun,
             usedIsBeforeRisshun: usedIsBeforeRisshun,
@@ -236,55 +224,9 @@ export default async function handler(req, res) {
               : {}),
           },
 
-          // ✅ 追加: 月柱境界の精密化デバッグ表示
-          monthBoundaryCheck: {
-            // 直前直後判定（tieBreak に従う）
-            standardIsBeforeMonthBoundary: stdIsBeforeMonthBoundary,
-            usedIsBeforeMonthBoundary: usedIsBeforeMonthBoundary,
-
-            standardTimeJst: `${std.y}-${pad2(std.m)}-${pad2(std.d)} ${formatHM(
-              std.hh,
-              std.mm
-            )}`,
-            usedTimeJst: `${used.y}-${pad2(used.m)}-${pad2(used.d)} ${formatHM(
-              used.hh,
-              used.mm
-            )}`,
-
-            // 採用した境界（＝この境界の直後〜次境界の直前が “今の月柱”）
-            boundaryName: monthBoundaryCurrent.name,
-            boundaryAngle: monthBoundaryCurrent.angle,
-            boundaryTimeJst: monthBoundaryCurrent.timeJst,
-            ...(precision === "second"
-              ? { boundaryTimeJstSec: monthBoundaryCurrent.timeJstSec }
-              : {}),
-
-            // 直前の節境界（prev）
-            prevBoundary: monthBoundaries.prev
-              ? {
-                  name: monthBoundaries.prev.name,
-                  angle: monthBoundaries.prev.angle,
-                  timeJst: monthBoundaries.prev.timeJst,
-                  ...(precision === "second"
-                    ? { timeJstSec: monthBoundaries.prev.timeJstSec }
-                    : {}),
-                }
-              : null,
-
-            // 次の節境界（next）
-            nextBoundary: monthBoundaries.next
-              ? {
-                  name: monthBoundaries.next.name,
-                  angle: monthBoundaries.next.angle,
-                  timeJst: monthBoundaries.next.timeJst,
-                  ...(precision === "second"
-                    ? { timeJstSec: monthBoundaries.next.timeJstSec }
-                    : {}),
-                }
-              : null,
-          },
+          // ✅ 追加：月柱境界チェック（直前直後判定＋前後節）
+          monthBoundaryCheck: monthBoundaryCheck,
         },
-
         place: {
           country: place.country,
           pref: place.pref,
@@ -293,7 +235,6 @@ export default async function handler(req, res) {
           ...(input.timeMode === "true_solar" ? { eqTimeMin: round2(eqTimeMin) } : {}),
         },
       },
-
       pillars: {
         year: {
           kan: yearPillar.kan,
@@ -322,7 +263,6 @@ export default async function handler(req, res) {
             }
           : null,
       },
-
       derived: {
         tenDeity,
         zokanTenDeity,
@@ -363,44 +303,22 @@ function readJsonBody(req) {
 
 function normalizeInput(body) {
   const date = safeString(body?.date);
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-    throw new Error("Invalid date (expected YYYY-MM-DD)");
-  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error("Invalid date (expected YYYY-MM-DD)");
 
   const timeRaw = safeString(body?.time);
-  if (timeRaw && !/^\d{2}:\d{2}(:\d{2})?$/.test(timeRaw)) {
-    throw new Error("Invalid time (expected HH:MM or HH:MM:SS)");
-  }
+  if (timeRaw && !/^\d{2}:\d{2}(:\d{2})?$/.test(timeRaw)) throw new Error("Invalid time (expected HH:MM or HH:MM:SS)");
 
   const sex = safeString(body?.sex);
   const birthPlace = body?.birthPlace && typeof body.birthPlace === "object" ? body.birthPlace : {};
   const country = safeString(birthPlace.country) || "JP";
   const pref = safeString(birthPlace.pref) || "東京都";
 
-  const timeMode = normalizeEnum(
-    safeString(body?.timeMode) || "standard",
-    ["standard", "mean_solar", "true_solar"],
-    "standard"
-  );
-
+  const timeMode = normalizeEnum(safeString(body?.timeMode) || "standard", ["standard", "mean_solar", "true_solar"], "standard");
   const dayBoundaryMode = normalizeEnum(String(body?.dayBoundaryMode || "24"), ["23", "24"], "24");
-  const boundaryTimeRef = normalizeEnum(
-    safeString(body?.boundaryTimeRef) || "used",
-    ["standard", "used"],
-    "used"
-  );
+  const boundaryTimeRef = normalizeEnum(safeString(body?.boundaryTimeRef) || "used", ["standard", "used"], "used");
 
-  const sekkiBoundaryPrecision = normalizeEnum(
-    safeString(body?.sekkiBoundaryPrecision) || "minute",
-    ["minute", "second"],
-    "minute"
-  );
-
-  const sekkiBoundaryTieBreak = normalizeEnum(
-    safeString(body?.sekkiBoundaryTieBreak) || "after",
-    ["after", "before"],
-    "after"
-  );
+  const sekkiBoundaryPrecision = normalizeEnum(safeString(body?.sekkiBoundaryPrecision) || "minute", ["minute", "second"], "minute");
+  const sekkiBoundaryTieBreak = normalizeEnum(safeString(body?.sekkiBoundaryTieBreak) || "after", ["after", "before"], "after");
 
   return {
     date,
@@ -459,7 +377,6 @@ function parseJstDateTime(dateStr, timeStr) {
     mm = parts[1] ?? 0;
     ss = parts[2] ?? 0;
   }
-  // dateObjUtc は「そのJST日時」をUTCに変換したもの
   const dateObjUtc = new Date(Date.UTC(y, m - 1, d, hh - 9, mm, ss));
   return { y, m, d, hh, mm, ss, dateObjUtc };
 }
@@ -490,8 +407,6 @@ function toJstSeconds(dt) {
 }
 
 function isBeforeBoundary(tSec, boundarySec, tieBreak) {
-  // after: t < boundary を「境界より前」とみなす（同秒は after 側）
-  // before: t <= boundary を「境界より前」とみなす（同秒は before 側）
   return tieBreak === "before" ? tSec <= boundarySec : tSec < boundarySec;
 }
 
@@ -578,7 +493,7 @@ function findSolarTermTimeJst(year, targetAngleDeg, precision) {
   const startUtc = new Date(Date.UTC(guess.y, guess.m - 1, guess.d, 0 - 9, 0, 0));
   const endUtc = new Date(startUtc.getTime() + 8 * 86400000);
 
-  const stepMs = 3600000; // 1 hour
+  const stepMs = 3600000;
   let t0 = startUtc.getTime();
   let f0 = angleDiffSigned(solarLongitudeDeg(new Date(t0)), targetAngleDeg);
 
@@ -595,7 +510,6 @@ function findSolarTermTimeJst(year, targetAngleDeg, precision) {
   }
 
   if (t1 === null) {
-    // widen window
     const start2 = startUtc.getTime() - 5 * 86400000;
     const end2 = endUtc.getTime() + 5 * 86400000;
     t0 = start2;
@@ -612,7 +526,6 @@ function findSolarTermTimeJst(year, targetAngleDeg, precision) {
   }
 
   if (t1 === null) {
-    // fallback: guess day noon
     const fallbackUtc = new Date(Date.UTC(guess.y, guess.m - 1, guess.d, 12 - 9, 0, 0));
     return formatTermResultJst(fallbackUtc, precision, targetAngleDeg);
   }
@@ -676,7 +589,7 @@ function guessSolarTermDateJst(year, angle) {
 }
 
 // ------------------------------
-// Sekki (12節 boundaries)
+// Sekki current (12節 boundaries)
 // ------------------------------
 const SEKKI_12 = [
   { angle: 315, name: "立春" },
@@ -693,64 +606,113 @@ const SEKKI_12 = [
   { angle: 285, name: "小寒" },
 ];
 
-/**
- * ✅ 月柱境界デバッグ用:
- * used時刻の「直前の節」「今有効な節」「次の節」を返す
- * - current: used が属する月（境界の直後〜次境界の直前）の“境界(開始点)”
- * - prev: current の一つ前
- * - next: current の次
- */
-function getMonthBoundariesAround(used, precision, tieBreak) {
+function getCurrentSekkiBoundary(used, precision, tieBreak) {
   const cand = [];
   for (const b of SEKKI_12) {
-    const prevY = getSolarTermCached(used.y - 1, b.angle, precision);
-    const curY  = getSolarTermCached(used.y, b.angle, precision);
-    const nextY = getSolarTermCached(used.y + 1, b.angle, precision);
-    cand.push({ ...b, ...prevY });
-    cand.push({ ...b, ...curY });
-    cand.push({ ...b, ...nextY });
+    const a = getSolarTermCached(used.y, b.angle, precision);
+    const b1 = getSolarTermCached(used.y - 1, b.angle, precision);
+    cand.push({ ...b, ...a });
+    cand.push({ ...b, ...b1 });
   }
-
-  // secJstでソート（時間軸）
-  cand.sort((a, b) => a.secJst - b.secJst);
 
   const usedSec = toJstSeconds(used);
 
-  // current = used の直前（after: <= / before: <）にある最後の境界
-  const isIncludedAsPast = (sec) => (tieBreak === "after" ? sec <= usedSec : sec < usedSec);
-  const isIncludedAsFuture = (sec) => (tieBreak === "after" ? sec > usedSec : sec >= usedSec);
-
-  let currentIdx = -1;
-  for (let i = 0; i < cand.length; i++) {
-    if (isIncludedAsPast(cand[i].secJst)) currentIdx = i;
+  let best = null;
+  for (const c of cand) {
+    const ok = tieBreak === "after" ? c.secJst <= usedSec : c.secJst < usedSec;
+    if (!ok) continue;
+    if (!best || c.secJst > best.secJst) best = c;
   }
 
-  // まれに見つからない場合（usedが最初より前）→先頭をcurrent扱いにしないでfallback
-  if (currentIdx < 0) {
-    // あり得るケース: 年初(1/1付近)で precision/tieBreak により取り逃がし
-    // → used.y-1 の小寒(285)を強制
+  if (!best) {
     const fb = getSolarTermCached(used.y - 1, 285, precision);
-    const current = { angle: 285, name: "小寒", ...fb };
-    // next は usedより未来で最小
-    const next = cand.find((c) => isIncludedAsFuture(c.secJst)) || null;
-    return { prev: null, current, next };
+    best = { angle: 285, name: "小寒", ...fb };
   }
 
-  const current = cand[currentIdx];
+  return {
+    name: best.name,
+    angle: best.angle,
+    timeJst: best.timeJst,
+    timeJstSec: best.timeJstSec,
+    secJst: best.secJst,
+  };
+}
 
-  // prev = currentより前で最も近い
-  const prev = currentIdx - 1 >= 0 ? cand[currentIdx - 1] : null;
+// ✅ 追加：月境界の前後節（prev / next）を求める
+function getPrevNextSekki(boundary, precision) {
+  const idx = SEKKI_12.findIndex((x) => x.angle === boundary.angle);
+  const prevIdx = idx <= 0 ? SEKKI_12.length - 1 : idx - 1;
+  const nextIdx = idx >= SEKKI_12.length - 1 ? 0 : idx + 1;
 
-  // next = usedより未来で最も近い（currentIdx+1が未来とは限らないので検索）
-  let next = null;
-  for (let i = currentIdx + 1; i < cand.length; i++) {
-    if (isIncludedAsFuture(cand[i].secJst)) {
-      next = cand[i];
-      break;
-    }
-  }
+  const prevDef = SEKKI_12[prevIdx];
+  const nextDef = SEKKI_12[nextIdx];
 
-  return { prev, current, next };
+  // prev / next の年またぎを調整（secで比較するので確実に）
+  const curSec = boundary.secJst;
+
+  // prev: curより必ず小さい sec を探す
+  const prevCand = [
+    { def: prevDef, year: boundaryTimeYearGuess(boundary, -1) },
+    { def: prevDef, year: boundaryTimeYearGuess(boundary, 0) },
+    { def: prevDef, year: boundaryTimeYearGuess(boundary, +1) },
+  ].map(({ def, year }) => ({ ...def, ...getSolarTermCached(year, def.angle, precision) }))
+   .filter((x) => x.secJst < curSec)
+   .sort((a, b) => b.secJst - a.secJst)[0] || ({ ...prevDef, ...getSolarTermCached(boundaryTimeYearGuess(boundary, -1), prevDef.angle, precision) });
+
+  // next: curより必ず大きい sec を探す
+  const nextCand = [
+    { def: nextDef, year: boundaryTimeYearGuess(boundary, -1) },
+    { def: nextDef, year: boundaryTimeYearGuess(boundary, 0) },
+    { def: nextDef, year: boundaryTimeYearGuess(boundary, +1) },
+  ].map(({ def, year }) => ({ ...def, ...getSolarTermCached(year, def.angle, precision) }))
+   .filter((x) => x.secJst > curSec)
+   .sort((a, b) => a.secJst - b.secJst)[0] || ({ ...nextDef, ...getSolarTermCached(boundaryTimeYearGuess(boundary, +1), nextDef.angle, precision) });
+
+  return {
+    prev: { name: prevCand.name, angle: prevCand.angle, timeJst: prevCand.timeJst, timeJstSec: prevCand.timeJstSec, secJst: prevCand.secJst },
+    next: { name: nextCand.name, angle: nextCand.angle, timeJst: nextCand.timeJst, timeJstSec: nextCand.timeJstSec, secJst: nextCand.secJst },
+  };
+}
+
+function boundaryTimeYearGuess(boundary, add) {
+  // boundary.timeJst の年を推定して加算する（簡易）
+  const y = parseInt(String(boundary.timeJst).slice(0, 4), 10);
+  return (Number.isFinite(y) ? y : 2000) + add;
+}
+
+// ✅ 追加：monthBoundaryCheck の構築
+function buildMonthBoundaryCheck({ std, used, precision, tieBreak, boundary }) {
+  const stdSec = toJstSeconds(std);
+  const usedSec = toJstSeconds(used);
+  const bSec = boundary.secJst;
+
+  const standardIsBeforeMonthBoundary = isBeforeBoundary(stdSec, bSec, tieBreak);
+  const usedIsBeforeMonthBoundary = isBeforeBoundary(usedSec, bSec, tieBreak);
+
+  const pn = getPrevNextSekki(boundary, precision);
+
+  return {
+    standardIsBeforeMonthBoundary,
+    usedIsBeforeMonthBoundary,
+    standardTimeJst: `${std.y}-${pad2(std.m)}-${pad2(std.d)} ${formatHM(std.hh, std.mm)}`,
+    usedTimeJst: `${used.y}-${pad2(used.m)}-${pad2(used.d)} ${formatHM(used.hh, used.mm)}`,
+    boundaryName: boundary.name,
+    boundaryAngle: boundary.angle,
+    boundaryTimeJst: boundary.timeJst,
+    ...(precision === "second" ? { boundaryTimeJstSec: boundary.timeJstSec } : {}),
+    prevBoundary: {
+      name: pn.prev.name,
+      angle: pn.prev.angle,
+      timeJst: pn.prev.timeJst,
+      ...(precision === "second" ? { timeJstSec: pn.prev.timeJstSec } : {}),
+    },
+    nextBoundary: {
+      name: pn.next.name,
+      angle: pn.next.angle,
+      timeJst: pn.next.timeJst,
+      ...(precision === "second" ? { timeJstSec: pn.next.timeJstSec } : {}),
+    },
+  };
 }
 
 // ------------------------------
@@ -764,10 +726,8 @@ function calcYearPillar(pillarYear) {
   return sexagenaryFromIndex(idx);
 }
 
-function calcMonthPillar(used, yearStem, precision, tieBreak) {
-  const around = getMonthBoundariesAround(used, precision, tieBreak);
-  const cur = around.current;
-  const monthBranch = monthBranchFromBoundaryAngle(cur.angle);
+function calcMonthPillarFromBoundary(monthBoundary, yearStem) {
+  const monthBranch = monthBranchFromBoundaryAngle(monthBoundary.angle);
   const monthStem = monthStemFromYearStem(yearStem, monthBranch);
   return { kan: monthStem, shi: monthBranch };
 }
@@ -809,7 +769,7 @@ function calcDayPillar(std, used, dayBoundaryMode, boundaryTimeRef) {
   }
 
   const jdn = julianDayNumber(y, m, d);
-  const idx = mod(jdn + 47, 60); // calibration: 1990-02-04 => 戊戌（検証に合わせ）
+  const idx = mod(jdn + 47, 60); // calibration: 1990-02-04 => 戊戌（あなたの検証に合わせ）
   return sexagenaryFromIndex(idx);
 }
 
