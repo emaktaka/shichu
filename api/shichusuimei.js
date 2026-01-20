@@ -6,10 +6,15 @@
 // Phase D: 「大運/年運」+ 年運は立春境界で切る精密版
 // Phase D+: 起運年齢を“分単位”で厳密計算（節までの差分Minutes ÷ (3日換算)）
 //
-// ★追加(Phase A検証用):
+// ★追加（節入り境界精密化: Phase A++）
 // - boundaryTimeRef: "used" | "standard"
 //   年柱（立春）境界判定を「補正後 usedUtc」か「補正前 stdUtc」どちらで行うかを選べる。
 //   デフォルト "used"（現状維持）。
+// - sekkiBoundaryPrecision: "second" | "minute"
+//   節入り境界比較の粒度。minute は分丸め比較で“表示(分)と判定(秒)”のズレを防ぐ。
+// - sekkiBoundaryTieBreak: "after" | "before"
+//   境界ちょうど(同一と見なした)場合に「節入り後」扱いするか。
+//   "after" 推奨（境界ちょうど＝切替後）
 //
 // POST /api/shichusuimei
 // body: {
@@ -20,6 +25,8 @@
 //   timeMode: "standard"|"mean_solar"|"true_solar",
 //   dayBoundaryMode: "23"|"24",
 //   boundaryTimeRef?: "used"|"standard",
+//   sekkiBoundaryPrecision?: "second"|"minute",
+//   sekkiBoundaryTieBreak?: "after"|"before",
 //   asOfDate?: "YYYY-MM-DD"
 // }
 //
@@ -206,6 +213,33 @@ function parseDateTimeJstToUtc(dateStr, timeStr) {
 }
 function pad2(n) { return String(n).padStart(2, "0"); }
 function fmtHHMM(hh, mm) { return `${pad2(hh)}:${pad2(mm)}`; }
+
+// ---- Phase A++: 秒表示/境界比較ユーティリティ ----
+function formatJstSec(dateUtc) {
+  // dateUtc(UTC) -> "YYYY-MM-DD HH:MM:SS" (JST)
+  const d = new Date(dateUtc.getTime() + 9 * 3600 * 1000);
+  const Y = d.getUTCFullYear();
+  const M = pad2(d.getUTCMonth() + 1);
+  const D = pad2(d.getUTCDate());
+  const hh = pad2(d.getUTCHours());
+  const mm = pad2(d.getUTCMinutes());
+  const ss = pad2(d.getUTCSeconds());
+  return `${Y}-${M}-${D} ${hh}:${mm}:${ss}`;
+}
+function toPrecisionTs(dateUtc, precision) {
+  const t = dateUtc.getTime();
+  if (precision === "minute") return Math.floor(t / 60000) * 60000; // truncate to minute
+  return t; // "second" (keep ms)
+}
+function compareWithTie(aUtc, bUtc, precision, tieBreak) {
+  const a = toPrecisionTs(aUtc, precision);
+  const b = toPrecisionTs(bUtc, precision);
+  if (a < b) return -1;
+  if (a > b) return 1;
+  // tie
+  // "after" => not before (treat as a is after-or-equal)
+  return tieBreak === "before" ? -1 : 1;
+}
 
 // ---- 十神（通変星） ----
 const STEM_INFO = {
@@ -417,6 +451,10 @@ export default async function handler(req, res) {
     // "used" (補正後 usedUtc) / "standard" (補正前 stdUtc)
     const boundaryTimeRef = body?.boundaryTimeRef ?? "used";
 
+    // ★追加：節入り境界 精密化
+    const sekkiBoundaryPrecision = body?.sekkiBoundaryPrecision ?? "second"; // "second" | "minute"
+    const sekkiBoundaryTieBreak = body?.sekkiBoundaryTieBreak ?? "after";     // "after" | "before"
+
     if (!date || typeof date !== "string") {
       return res.status(400).json({ ok: false, error: "date required (YYYY-MM-DD)" });
     }
@@ -475,12 +513,16 @@ export default async function handler(req, res) {
     const boundaryUtc = (boundaryTimeRef === "standard") ? stdUtc : usedUtc;
 
     let yearForPillar = Y;
-    if (risshun && boundaryUtc.getTime() < risshun.timeUtc.getTime()) {
-      yearForPillar = Y - 1;
+    if (risshun) {
+      // 精密化：precision/tieBreak を反映
+      // compareWithTie(boundary, risshun) === -1 => boundary is before risshun
+      const cmp = compareWithTie(boundaryUtc, risshun.timeUtc, sekkiBoundaryPrecision, sekkiBoundaryTieBreak);
+      if (cmp === -1) {
+        yearForPillar = Y - 1;
+      }
     }
-    const yearP = calcYearPillarByRisshun(yearForPillar);
 
-    // 月柱は現状維持：usedUtc（補正後）で節境界を見る
+    const yearP = calcYearPillarByRisshun(yearForPillar);
     const monthP = calcMonthPillarByJie(usedUtc, yearP.kan);
 
     // ---- Phase C: 日柱（23/24切替）----
@@ -591,22 +633,14 @@ export default async function handler(req, res) {
         timeModeUsed: timeMode,
         dayBoundaryModeUsed: String(dayBoundaryMode),
         boundaryTimeRefUsed: boundaryTimeRef,
+        sekkiBoundaryPrecisionUsed: sekkiBoundaryPrecision,
+        sekkiBoundaryTieBreakUsed: sekkiBoundaryTieBreak,
         sekkiUsed: monthP.sekkiUsed,
         yearBoundary: risshun ? { name: "立春", timeJst: formatJst(risshun.timeUtc) } : null,
         yearPillarYearUsed: yearForPillar
       },
       place: birthPlace ? { ...birthPlace } : null
     };
-
-    // ★追加：検証用（標準/補正後のどちらが立春前かを併記）
-    if (risshun) {
-      meta.used.yearBoundaryCheck = {
-        standardIsBeforeRisshun: stdUtc.getTime() < risshun.timeUtc.getTime(),
-        usedIsBeforeRisshun: usedUtc.getTime() < risshun.timeUtc.getTime(),
-        standardTimeJst: formatJst(stdUtc),
-        usedTimeJst: formatJst(usedUtc)
-      };
-    }
 
     if ((timeMode === "mean_solar" || timeMode === "true_solar") && birthPlace?.country === "JP" && birthPlace?.pref) {
       meta.place = {
@@ -615,6 +649,24 @@ export default async function handler(req, res) {
         lonCorrectionMin: Number((lonCorrectionMin).toFixed(2)),
         ...(timeMode === "true_solar" ? { eqTimeMin: Number((eqTimeMin).toFixed(2)) } : {})
       };
+    }
+
+    // ★追加：検証用（標準/補正後のどちらが立春前かを併記 + 秒表示）
+    if (risshun) {
+      meta.used.yearBoundaryCheck = {
+        standardIsBeforeRisshun: compareWithTie(stdUtc, risshun.timeUtc, sekkiBoundaryPrecision, sekkiBoundaryTieBreak) === -1,
+        usedIsBeforeRisshun: compareWithTie(usedUtc, risshun.timeUtc, sekkiBoundaryPrecision, sekkiBoundaryTieBreak) === -1,
+        standardTimeJst: formatJst(stdUtc),
+        usedTimeJst: formatJst(usedUtc),
+        standardTimeJstSec: formatJstSec(stdUtc),
+        usedTimeJstSec: formatJstSec(usedUtc),
+        risshunTimeJstSec: formatJstSec(risshun.timeUtc)
+      };
+    }
+
+    // sekkiUsed(=月柱境界に使った節) も秒表示を追加（立春のとき分表示と判定ズレが起きやすい）
+    if (meta.used?.sekkiUsed?.timeJst && risshun && meta.used.sekkiUsed.name === "立春") {
+      meta.used.sekkiUsed.timeJstSec = formatJstSec(risshun.timeUtc);
     }
 
     const result = {
@@ -627,6 +679,8 @@ export default async function handler(req, res) {
         timeMode,
         dayBoundaryMode,
         boundaryTimeRef,
+        sekkiBoundaryPrecision,
+        sekkiBoundaryTieBreak,
         ...(asOfDate ? { asOfDate } : {})
       },
       meta,
