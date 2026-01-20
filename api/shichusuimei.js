@@ -6,6 +6,11 @@
 // Phase D: 「大運/年運」+ 年運は立春境界で切る精密版
 // Phase D+: 起運年齢を“分単位”で厳密計算（節までの差分Minutes ÷ (3日換算)）
 //
+// ★追加(Phase A検証用):
+// - boundaryTimeRef: "used" | "standard"
+//   年柱（立春）境界判定を「補正後 usedUtc」か「補正前 stdUtc」どちらで行うかを選べる。
+//   デフォルト "used"（現状維持）。
+//
 // POST /api/shichusuimei
 // body: {
 //   date: "YYYY-MM-DD",
@@ -14,6 +19,7 @@
 //   birthPlace: {country:"JP", pref:"東京都"} | null,
 //   timeMode: "standard"|"mean_solar"|"true_solar",
 //   dayBoundaryMode: "23"|"24",
+//   boundaryTimeRef?: "used"|"standard",
 //   asOfDate?: "YYYY-MM-DD"
 // }
 //
@@ -407,6 +413,10 @@ export default async function handler(req, res) {
     const dayBoundaryMode = body?.dayBoundaryMode ?? "24";
     const asOfDate = body?.asOfDate ?? null;
 
+    // ★追加：年柱(立春)境界判定に使う時刻参照
+    // "used" (補正後 usedUtc) / "standard" (補正前 stdUtc)
+    const boundaryTimeRef = body?.boundaryTimeRef ?? "used";
+
     if (!date || typeof date !== "string") {
       return res.status(400).json({ ok: false, error: "date required (YYYY-MM-DD)" });
     }
@@ -461,11 +471,16 @@ export default async function handler(req, res) {
     const jieThis = buildJie12Utc(Y);
     const risshun = jieThis.find(j => j.angle === 315) || null;
 
+    // ★追加：境界判定に使う基準時刻
+    const boundaryUtc = (boundaryTimeRef === "standard") ? stdUtc : usedUtc;
+
     let yearForPillar = Y;
-    if (risshun && usedUtc.getTime() < risshun.timeUtc.getTime()) {
+    if (risshun && boundaryUtc.getTime() < risshun.timeUtc.getTime()) {
       yearForPillar = Y - 1;
     }
     const yearP = calcYearPillarByRisshun(yearForPillar);
+
+    // 月柱は現状維持：usedUtc（補正後）で節境界を見る
     const monthP = calcMonthPillarByJie(usedUtc, yearP.kan);
 
     // ---- Phase C: 日柱（23/24切替）----
@@ -575,12 +590,23 @@ export default async function handler(req, res) {
         time: usedHHMM || "",
         timeModeUsed: timeMode,
         dayBoundaryModeUsed: String(dayBoundaryMode),
+        boundaryTimeRefUsed: boundaryTimeRef,
         sekkiUsed: monthP.sekkiUsed,
         yearBoundary: risshun ? { name: "立春", timeJst: formatJst(risshun.timeUtc) } : null,
         yearPillarYearUsed: yearForPillar
       },
       place: birthPlace ? { ...birthPlace } : null
     };
+
+    // ★追加：検証用（標準/補正後のどちらが立春前かを併記）
+    if (risshun) {
+      meta.used.yearBoundaryCheck = {
+        standardIsBeforeRisshun: stdUtc.getTime() < risshun.timeUtc.getTime(),
+        usedIsBeforeRisshun: usedUtc.getTime() < risshun.timeUtc.getTime(),
+        standardTimeJst: formatJst(stdUtc),
+        usedTimeJst: formatJst(usedUtc)
+      };
+    }
 
     if ((timeMode === "mean_solar" || timeMode === "true_solar") && birthPlace?.country === "JP" && birthPlace?.pref) {
       meta.place = {
@@ -600,6 +626,7 @@ export default async function handler(req, res) {
         birthPlace,
         timeMode,
         dayBoundaryMode,
+        boundaryTimeRef,
         ...(asOfDate ? { asOfDate } : {})
       },
       meta,
