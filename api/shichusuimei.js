@@ -13,6 +13,11 @@
  * ✅ 重要:
  * - package.json が "type":"module" のため ESM（export default）で統一
  * - 追加ミス防止: 防御的パース + 例外は必ず {ok:false,error} で返す
+ *
+ * ✅ 今回の修正（重要）:
+ * - sekkiBoundaryPrecision を「比較ロジック」に正しく反映
+ *   -> minute のときは分単位比較、second のときは秒単位比較
+ *   -> tieBreak は「同値(同じ分/同じ秒)」のときだけ効く
  */
 
 // ------------------------------
@@ -71,17 +76,20 @@ export default async function handler(req, res) {
     // ---- Risshun time (angle 315) ----
     const risshunThisYear = getSolarTermCached(used.y, 315, precision);
 
-    const stdJstSec = toJstSeconds(std);
-    const usedJstSec = toJstSeconds(used);
+    // 秒(生)は保持しつつ、比較は precision に応じて量子化して行う
+    const stdJstSecRaw = toJstSeconds(std);
+    const usedJstSecRaw = toJstSeconds(used);
 
-    const stdIsBeforeRisshun = isBeforeBoundary(
-      stdJstSec,
+    const stdIsBeforeRisshun = isBeforeBoundaryPrec(
+      stdJstSecRaw,
       risshunThisYear.secJst,
+      precision,
       tieBreak
     );
-    const usedIsBeforeRisshun = isBeforeBoundary(
-      usedJstSec,
+    const usedIsBeforeRisshun = isBeforeBoundaryPrec(
+      usedJstSecRaw,
       risshunThisYear.secJst,
+      precision,
       tieBreak
     );
 
@@ -134,6 +142,21 @@ export default async function handler(req, res) {
       birthStd: std,
     });
 
+    // ---- meta.yearBoundaryCheck（precision反映済み）----
+    const yearBoundaryCheck = {
+      standardIsBeforeRisshun: stdIsBeforeRisshun,
+      usedIsBeforeRisshun: usedIsBeforeRisshun,
+      standardTimeJst: `${std.y}-${pad2(std.m)}-${pad2(std.d)} ${formatHM(std.hh, std.mm)}`,
+      usedTimeJst: `${used.y}-${pad2(used.m)}-${pad2(used.d)} ${formatHM(used.hh, used.mm)}`,
+      ...(precision === "second"
+        ? {
+            standardTimeJstSec: `${std.y}-${pad2(std.m)}-${pad2(std.d)} ${formatHMS(std.hh, std.mm, std.ss)}`,
+            usedTimeJstSec: `${used.y}-${pad2(used.m)}-${pad2(used.d)} ${formatHMS(used.hh, used.mm, used.ss)}`,
+            risshunTimeJstSec: risshunThisYear.timeJstSec,
+          }
+        : {}),
+    };
+
     // ---- Build response ----
     const resp = {
       ok: true,
@@ -172,30 +195,7 @@ export default async function handler(req, res) {
             ...(precision === "second" ? { timeJstSec: risshunThisYear.timeJstSec } : {}),
           },
           yearPillarYearUsed,
-          yearBoundaryCheck: {
-            // ✅ ここが修正点：standardIsBeforeRisshun → stdIsBeforeRisshun
-            standardIsBeforeRisshun: stdIsBeforeRisshun,
-            usedIsBeforeRisshun: usedIsBeforeRisshun,
-            standardTimeJst: `${std.y}-${pad2(std.m)}-${pad2(std.d)} ${formatHM(
-              std.hh,
-              std.mm
-            )}`,
-            usedTimeJst: `${used.y}-${pad2(used.m)}-${pad2(used.d)} ${formatHM(
-              used.hh,
-              used.mm
-            )}`,
-            ...(precision === "second"
-              ? {
-                  standardTimeJstSec: `${std.y}-${pad2(std.m)}-${pad2(
-                    std.d
-                  )} ${formatHMS(std.hh, std.mm, std.ss)}`,
-                  usedTimeJstSec: `${used.y}-${pad2(used.m)}-${pad2(
-                    used.d
-                  )} ${formatHMS(used.hh, used.mm, used.ss)}`,
-                  risshunTimeJstSec: risshunThisYear.timeJstSec,
-                }
-              : {}),
-          },
+          yearBoundaryCheck,
         },
         place: {
           country: place.country,
@@ -376,8 +376,58 @@ function toJstSeconds(dt) {
   return Math.floor((dt.dateObjUtc.getTime() + 9 * 3600 * 1000) / 1000);
 }
 
-function isBeforeBoundary(tSec, boundarySec, tieBreak) {
-  return tieBreak === "before" ? tSec <= boundarySec : tSec < boundarySec;
+/**
+ * ✅ precision反映版：境界「より前か？」判定
+ * - minute: floor(sec/60) で比較（分単位）
+ * - second: sec で比較（秒単位）
+ * - tieBreak:
+ *    after  => 同値のとき「前ではない」（= after側に倒す）
+ *    before => 同値のとき「前である」（= before側に倒す）
+ */
+function isBeforeBoundaryPrec(tSecRaw, boundarySecRaw, precision, tieBreak) {
+  const t = quantByPrecision(tSecRaw, precision);
+  const b = quantByPrecision(boundarySecRaw, precision);
+
+  if (t < b) return true;
+  if (t > b) return false;
+
+  // equal at precision
+  return tieBreak === "before";
+}
+
+/**
+ * ✅ precision反映版：境界が「過去側として成立するか？」（直近節の選択用）
+ * - t == boundary (同値) の扱いだけ tieBreak に依存
+ *   after  => 同値は「既に超えた(過去)」
+ *   before => 同値は「まだ超えてない(未来)」
+ */
+function isBoundaryInPastOrNow(boundarySecRaw, tSecRaw, precision, tieBreak) {
+  const t = quantByPrecision(tSecRaw, precision);
+  const b = quantByPrecision(boundarySecRaw, precision);
+
+  if (b < t) return true;
+  if (b > t) return false;
+  return tieBreak === "after";
+}
+
+/**
+ * ✅ precision反映版：境界が「未来側として成立するか？」（次節の選択用）
+ * - t == boundary (同値) の扱いだけ tieBreak に依存
+ *   before => 同値は「まだ(未来)」
+ *   after  => 同値は「もう(過去)」
+ */
+function isBoundaryInFutureOrNow(boundarySecRaw, tSecRaw, precision, tieBreak) {
+  const t = quantByPrecision(tSecRaw, precision);
+  const b = quantByPrecision(boundarySecRaw, precision);
+
+  if (b > t) return true;
+  if (b < t) return false;
+  return tieBreak === "before";
+}
+
+function quantByPrecision(sec, precision) {
+  if (precision === "minute") return Math.floor(sec / 60);
+  return sec; // "second"
 }
 
 function pad2(n) { return String(n).padStart(2, "0"); }
@@ -537,6 +587,7 @@ function formatTermResultJst(dateUtc, precision, angle) {
     angle,
     timeJst,
     timeJstSec,
+    // secJst は生の秒を保持（比較時に precision で量子化する）
     secJst: Math.floor((dateUtc.getTime() + 9 * 3600 * 1000) / 1000),
   };
 }
@@ -589,9 +640,19 @@ function getCurrentSekkiBoundary(used, precision, tieBreak) {
 
   let best = null;
   for (const c of cand) {
-    const ok = tieBreak === "after" ? c.secJst <= usedSec : c.secJst < usedSec;
+    const ok = isBoundaryInPastOrNow(c.secJst, usedSec, precision, tieBreak);
     if (!ok) continue;
-    if (!best || c.secJst > best.secJst) best = c;
+    if (!best) best = c;
+    else {
+      // 直近（= 最大）を選ぶ：precisionに合わせて比較
+      const bc = quantByPrecision(best.secJst, precision);
+      const cc = quantByPrecision(c.secJst, precision);
+      if (cc > bc) best = c;
+      else if (cc === bc) {
+        // 同値(同じ分/同じ秒)なら、より「実秒が後」の方を採用（デバッグ安定）
+        if (c.secJst > best.secJst) best = c;
+      }
+    }
   }
 
   if (!best) {
@@ -825,7 +886,7 @@ function calcLuckAll({ used, sex, yearStem, monthPillar, precision, tieBreak, bi
   const currentDayunIndex = findCurrentDayunIndex(dayun, ageYears);
   const currentDayun = currentDayunIndex >= 0 ? dayun[currentDayunIndex] : null;
 
-  const nenunYearByRisshun = calcNenunYearByRisshun(nowJst, precision);
+  const nenunYearByRisshun = calcNenunYearByRisshun(nowJst, precision, tieBreak);
   const nenun = buildNenunList(nenunYearByRisshun);
 
   const currentNenunIndex = nenun.findIndex((x) => x.pillarYear === nenunYearByRisshun);
@@ -871,22 +932,44 @@ function calcStartDiffMinutesToJie(used, direction, precision, tieBreak) {
   const usedSec = toJstSeconds(used);
 
   if (direction === "forward") {
+    // 次の節まで
     let best = null;
     for (const c of cand) {
-      const ok = tieBreak === "after" ? c.secJst > usedSec : c.secJst >= usedSec;
+      const ok = isBoundaryInFutureOrNow(c.secJst, usedSec, precision, tieBreak);
       if (!ok) continue;
-      if (!best || c.secJst < best.secJst) best = c;
+
+      if (!best) best = c;
+      else {
+        const bc = quantByPrecision(best.secJst, precision);
+        const cc = quantByPrecision(c.secJst, precision);
+        if (cc < bc) best = c;
+        else if (cc === bc && c.secJst < best.secJst) best = c;
+      }
     }
-    if (!best) best = cand.sort((a, b) => a.secJst - b.secJst)[0];
+    if (!best) {
+      best = cand.sort((a, b) => a.secJst - b.secJst)[0];
+    }
+
     return (best.secJst - usedSec) / 60;
   } else {
+    // 直前の節から
     let best = null;
     for (const c of cand) {
-      const ok = tieBreak === "after" ? c.secJst <= usedSec : c.secJst < usedSec;
+      const ok = isBoundaryInPastOrNow(c.secJst, usedSec, precision, tieBreak);
       if (!ok) continue;
-      if (!best || c.secJst > best.secJst) best = c;
+
+      if (!best) best = c;
+      else {
+        const bc = quantByPrecision(best.secJst, precision);
+        const cc = quantByPrecision(c.secJst, precision);
+        if (cc > bc) best = c;
+        else if (cc === bc && c.secJst > best.secJst) best = c;
+      }
     }
-    if (!best) best = cand.sort((a, b) => b.secJst - a.secJst)[0];
+    if (!best) {
+      best = cand.sort((a, b) => b.secJst - a.secJst)[0];
+    }
+
     return (usedSec - best.secJst) / 60;
   }
 }
@@ -947,11 +1030,12 @@ function findCurrentDayunIndex(dayun, ageYears) {
   return -1;
 }
 
-function calcNenunYearByRisshun(nowJst, precision) {
+function calcNenunYearByRisshun(nowJst, precision, tieBreak) {
   const risshun = getSolarTermCached(nowJst.y, 315, precision);
   const nowUtc = Date.UTC(nowJst.y, nowJst.m - 1, nowJst.d, nowJst.hh - 9, nowJst.mm, nowJst.ss);
   const nowSecJst = Math.floor((nowUtc + 9 * 3600 * 1000) / 1000);
-  const before = nowSecJst < risshun.secJst;
+
+  const before = isBeforeBoundaryPrec(nowSecJst, risshun.secJst, precision, tieBreak);
   return before ? (nowJst.y - 1) : nowJst.y;
 }
 
