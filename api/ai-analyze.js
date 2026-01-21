@@ -6,6 +6,11 @@
  * - 入力: { result: < /api/shichusuimei のレスポンス丸ごと > }
  * - 出力: { ok:true, text:"..." }
  *
+ * ✅ 追加（今回 / C強化）:
+ * - 二人称禁止（「あなた」等を使わず「命主/この方/ご本人」で統一）
+ * - 「節入り境界の読み（年/⽉）」章が必ず出るように検証し、不足なら1回だけ再生成
+ * - 末尾に「鑑定師用要点（箇条書き）」を必ず追加（編集前提の要約）
+ *
  * ✅ 重要:
  * - package.json が "type":"module" のため ESM（export default）
  * - OpenAI: Responses APIを優先し、失敗時はChat Completionsへフォールバック
@@ -45,36 +50,24 @@ export default async function handler(req, res) {
     const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
     const temperature = clampNumber(process.env.OPENAI_TEMPERATURE, 0.6, 0, 1.5);
 
-    // 1st prompt
-    const prompt1 = buildJapanesePrompt(result);
+    // 1st generation
+    const prompt1 = buildJapanesePrompt(result, { attempt: 1 });
+    let text = await callOpenAIText({ apiKey, model, temperature, prompt: prompt1 });
 
-    let text = await callOpenAIText({
-      apiKey,
-      model,
-      temperature,
-      prompt: prompt1,
-    });
-
-    // ✅ 安全弁：節入り境界（年/月）の章が薄い/消える事故を防ぐ（1回だけ再生成）
-    // 目安: 「節入り境界」 or 「境界」 or monthBoundary/立春の話題が本文に見当たらない場合
-    if (!looksLikeBoundaryIncluded(text)) {
-      const prompt2 = `${prompt1}
-
----
-
-【追加指示（必須）】
-- 本文の「2. 節入り境界の読み」で、年（立春）と月（直近の節）の両方について、
-  “境界生まれ/境界直前直後”の意味を必ず具体的に説明してください。
-- monthBoundaryCheck に prevBoundary/nextBoundary がある場合、前後の節名も文章に含めてください。
-- それ以外の構成順は変えないでください。`.trim();
-
+    // Validate required sections & style
+    if (!passesQualityGate(text)) {
+      // 2nd generation (only once): stricter instructions with a small retry note
+      const prompt2 = buildJapanesePrompt(result, { attempt: 2, previousText: text });
       text = await callOpenAIText({
         apiKey,
         model,
-        temperature,
+        temperature: Math.min(temperature + 0.05, 1.2),
         prompt: prompt2,
       });
     }
+
+    // Final safety polish (soft): enforce no "あなた" if it slips
+    text = sanitizeSecondPerson(text);
 
     res.statusCode = 200;
     return res.end(JSON.stringify({ ok: true, text }));
@@ -110,9 +103,49 @@ function clampNumber(v, fallback, min, max) {
 }
 
 // ------------------------------
-// Prompt builder (JP)
+// Quality gate (required sections + "no あなた")
 // ------------------------------
-function buildJapanesePrompt(result) {
+function passesQualityGate(text) {
+  if (!text || typeof text !== "string") return false;
+
+  // Must include these section headers (Markdown "##")
+  const must = [
+    /##\s*1\.\s*宿命と性格の本質/,
+    /##\s*2\.\s*節入り境界の読み/,
+    /##\s*6\.\s*今の運気テーマ/,
+    /##\s*7\.\s*開運アクション/,
+    /##\s*鑑定師用要点/,
+  ];
+
+  for (const re of must) {
+    if (!re.test(text)) return false;
+  }
+
+  // Must mention year/month boundary keywords somewhere
+  const boundaryWordsOk =
+    /(立春|年の境界|年境界)/.test(text) && /(月|節|月の境界|月境界)/.test(text);
+  if (!boundaryWordsOk) return false;
+
+  // "あなた" should not appear
+  if (/(あなた|君|きみ|貴方)/.test(text)) return false;
+
+  return true;
+}
+
+function sanitizeSecondPerson(text) {
+  // Hard replace only obvious "あなた" occurrences (best-effort)
+  // ※完全な文脈変換はAI側での遵守を前提にし、ここは“保険”として軽めにする
+  return String(text)
+    .replaceAll("あなた", "命主")
+    .replaceAll("貴方", "命主")
+    .replaceAll("きみ", "命主")
+    .replaceAll("君", "命主");
+}
+
+// ------------------------------
+// Prompt builder (JP)  ※Cベース維持 + 強化
+// ------------------------------
+function buildJapanesePrompt(result, { attempt, previousText } = {}) {
   const inp = result.input || {};
   const meta = result.meta || {};
   const used = meta.used || {};
@@ -187,34 +220,52 @@ function buildJapanesePrompt(result) {
     },
   };
 
-  // ✅ 出力仕様（AIへの指示）
-  const instruction = `
+  const baseRule = `
 あなたは四柱推命の鑑定文を日本語で作る専門家です。
-以下のJSON（命式結果）を元に、ユーザー向けの自然な鑑定文を書いてください。
+以下のJSON（命式結果）を元に、鑑定師が扱いやすい自然な鑑定文を書いてください。
 
-【重要ルール】
+【最重要ルール（必ず遵守）】
+- 二人称「あなた」「君」「貴方」を一切使わない。呼称は「命主」「この方」「ご本人」で統一する。
 - 内部用語（デカン、API、Phaseなど）や実装用語は絶対に出さない。
-- ただし「節入り境界」の情報は、必ず“人間向けの言葉”に言い換えて鑑定に反映する。
-- 境界は「年（立春）」「月（直近の節）」の2つがある。両方を必ず本文で扱う。
-- 境界の扱い:
-  - 「直前/直後」や「前後の影響が混ざる」など、“境界生まれ”の意味を説明する。
-  - monthBoundaryCheck に prevBoundary/nextBoundary があれば、前後の節名も文章に出してよい（節名はOK）。
-- 文量: 見出し付きで、読みやすく。長文だが冗長すぎない。
-- 構成（必ずこの順）:
-  1. 宿命と性格の本質（まず日干中心）
-  2. 節入り境界の読み（年/⽉：境界の影響をわかりやすく）
-  3. 五行バランス（不足と補い方）
-  4. 仕事運
-  5. 恋愛・対人
-  6. 今の運気テーマ（大運・年運）
-  7. 開運アクション（今日/今週できる3つ）
+- 「節入り境界の読み（年/⽉）」は必ず本文の章として出す（年=立春 / 月=節）。
+- 境界の説明は、単なる時刻の羅列で終わらせず、
+  「境界の直前/直後は性質が混ざる」「境界付近は出方が揺れやすい」など“境界生まれ”の意味を鑑定語として説明する。
+- monthBoundaryCheck に prevBoundary/nextBoundary があれば、前後の節名を文章に入れてよい（節名は表示OK）。
+
+【構成（必ずこの順 / 見出しは固定）】
+# 四柱推命鑑定結果
+## 1. 宿命と性格の本質（まず日干中心）
+## 2. 節入り境界の読み（年/⽉：境界の影響をわかりやすく）
+## 3. 五行バランス（不足と補い方）
+## 4. 仕事運
+## 5. 恋愛・対人
+## 6. 今の運気テーマ（大運・年運）
+## 7. 開運アクション（今日/今週できる3つ）
+## 鑑定師用要点（編集用メモ）
+- 5〜10行の箇条書きで「要点」「注意点」「境界由来の補足」をまとめる
 
 【出力形式】
 - Markdown（# や ## を使う）
 - 最後に余計な注釈や断り文は書かない
 `.trim();
 
-  return `${instruction}\n\n---\n\n命式JSON:\n${JSON.stringify(payload, null, 2)}`;
+  const retryAdd =
+    attempt === 2
+      ? `
+【再生成の注意（重要）】
+- 前回出力に不足がありました。今回は必ず次を満たすこと:
+  1) 「## 2. 節入り境界の読み」が明確に存在し、年(立春)と月(節)の両方を説明している
+  2) 「## 鑑定師用要点（編集用メモ）」が末尾に存在する
+  3) 二人称「あなた」を使わない
+`.trim()
+      : "";
+
+  const prev =
+    attempt === 2 && previousText
+      ? `\n\n---\n前回出力（参照用・改善して再作成すること）:\n${String(previousText).slice(0, 2000)}\n`
+      : "";
+
+  return `${baseRule}\n\n${retryAdd}\n\n---\n\n命式JSON:\n${JSON.stringify(payload, null, 2)}${prev}`;
 }
 
 function buildBoundaryNarrative({ typeLabel, boundary, check, tieBreak, precision }) {
@@ -226,7 +277,6 @@ function buildBoundaryNarrative({ typeLabel, boundary, check, tieBreak, precisio
   const bName = boundary.name || "（不明）";
   const bTime = boundary.timeJstSec || boundary.timeJst || "（不明）";
 
-  // tieBreakの意味（同秒の扱い）
   const tieNote =
     precision === "second"
       ? `（同秒の扱い：${tieBreak === "before" ? "同秒は“前”扱い" : "同秒は“後”扱い"}）`
@@ -257,8 +307,12 @@ function buildMonthBoundaryNarrative({ boundary, check, tieBreak, precision }) {
   const stdT = check.standardTimeJstSec || check.standardTimeJst || "（不明）";
   const usedT = check.usedTimeJstSec || check.usedTimeJst || "（不明）";
 
-  const prev = check.prevBoundary ? `前の節は「${check.prevBoundary.name}（${check.prevBoundary.timeJstSec || check.prevBoundary.timeJst}）」` : "";
-  const next = check.nextBoundary ? `次の節は「${check.nextBoundary.name}（${check.nextBoundary.timeJstSec || check.nextBoundary.timeJst}）」` : "";
+  const prev = check.prevBoundary
+    ? `前の節は「${check.prevBoundary.name}（${check.prevBoundary.timeJstSec || check.prevBoundary.timeJst}）」`
+    : "";
+  const next = check.nextBoundary
+    ? `次の節は「${check.nextBoundary.name}（${check.nextBoundary.timeJstSec || check.nextBoundary.timeJst}）」`
+    : "";
 
   const tieNote =
     precision === "second"
@@ -267,33 +321,15 @@ function buildMonthBoundaryNarrative({ boundary, check, tieBreak, precision }) {
 
   const around = [prev, next].filter(Boolean).join(" / ");
 
-  // diffがあれば、AIが「境界にどれだけ近いか」を説明しやすい
-  const diffStd = check?.diff?.standard?.label ? `標準時は境界の${check.diff.standard.label}（${check.diff.standard.minutes}分差）` : "";
-  const diffUsed = check?.diff?.used?.label ? `補正後は境界の${check.diff.used.label}（${check.diff.used.minutes}分差）` : "";
-  const diffNote = [diffStd, diffUsed].filter(Boolean).join(" / ");
-
   return `月の節境界は「${bName}（${bTime}）」です。標準時(${stdT})は境界の${
     sBefore ? "前" : "後"
   }、補正後(${usedT})も境界の${uBefore ? "前" : "後"}判定です。${
     around ? `（${around}）` : ""
-  }${diffNote ? `（${diffNote}）` : ""}${tieNote}`.trim();
+  }${tieNote}`.trim();
 }
 
 function pad2(n) {
   return String(n).padStart(2, "0");
-}
-
-function looksLikeBoundaryIncluded(text) {
-  if (!text || typeof text !== "string") return false;
-  const s = text;
-  // ざっくり検知（強すぎる縛りは避ける）
-  return (
-    s.includes("節入り境界") ||
-    s.includes("境界") ||
-    s.includes("立春") ||
-    s.includes("直前") ||
-    s.includes("直後")
-  );
 }
 
 // ------------------------------
@@ -317,7 +353,6 @@ async function callOpenAIText({ apiKey, model, temperature, prompt }) {
 
     if (r.ok) {
       const j = await r.json();
-      // responses: output_text が使えることが多い
       const txt =
         (typeof j?.output_text === "string" && j.output_text) ||
         extractTextFromResponses(j);
@@ -354,8 +389,6 @@ async function callOpenAIText({ apiKey, model, temperature, prompt }) {
 }
 
 function extractTextFromResponses(j) {
-  // いろいろな形のresponses出力に対応して拾う
-  // output: [{content:[{type:"output_text",text:"..."}]}]
   const out = j?.output;
   if (!Array.isArray(out)) return "";
   const parts = [];
