@@ -16,6 +16,11 @@
  *   - その直前直後判定（standard/used の両方）
  *   - prevBoundary / nextBoundary（前後の節）もデバッグ表示
  *
+ * ✅ B（diff追加・今回の依頼）:
+ * - monthBoundaryCheck に「境界からの差分（秒/分/日）」を追加
+ *   - standard/used の両方で
+ *   - UIで “直前/直後” を数値で表示できる
+ *
  * ✅ 重要:
  * - package.json が "type":"module" のため ESM（export default）で統一
  * - 追加ミス防止: 防御的パース + 例外は必ず {ok:false,error} で返す
@@ -96,7 +101,8 @@ export default async function handler(req, res) {
     // ✅ 現在の節（12節）＝月柱判定に使う境界（直近の節）
     const monthBoundary = getCurrentSekkiBoundary(used, precision, tieBreak);
 
-    // ✅ monthBoundaryCheck（デバッグ用：前後節も含む + diff追加）
+    // ✅ monthBoundaryCheck（デバッグ用：前後節も含む）
+    // ✅ B（diff追加）：境界からの差分（秒/分/日）も含む
     const monthBoundaryCheck = buildMonthBoundaryCheck({
       std,
       used,
@@ -224,7 +230,8 @@ export default async function handler(req, res) {
               : {}),
           },
 
-          // ✅ 追加：月柱境界チェック（直前直後判定＋前後節＋diff）
+          // ✅ 追加：月柱境界チェック（直前直後判定＋前後節）
+          // ✅ B（diff追加）：境界からの差分（秒/分/日）付き
           monthBoundaryCheck: monthBoundaryCheck,
         },
         place: {
@@ -651,22 +658,28 @@ function getPrevNextSekki(boundary, precision) {
   const curSec = boundary.secJst;
 
   // prev: curより必ず小さい sec を探す
-  const prevCand = [
-    { def: prevDef, year: boundaryTimeYearGuess(boundary, -1) },
-    { def: prevDef, year: boundaryTimeYearGuess(boundary, 0) },
-    { def: prevDef, year: boundaryTimeYearGuess(boundary, +1) },
-  ].map(({ def, year }) => ({ ...def, ...getSolarTermCached(year, def.angle, precision) }))
-   .filter((x) => x.secJst < curSec)
-   .sort((a, b) => b.secJst - a.secJst)[0] || ({ ...prevDef, ...getSolarTermCached(boundaryTimeYearGuess(boundary, -1), prevDef.angle, precision) });
+  const prevCand =
+    [
+      { def: prevDef, year: boundaryTimeYearGuess(boundary, -1) },
+      { def: prevDef, year: boundaryTimeYearGuess(boundary, 0) },
+      { def: prevDef, year: boundaryTimeYearGuess(boundary, +1) },
+    ]
+      .map(({ def, year }) => ({ ...def, ...getSolarTermCached(year, def.angle, precision) }))
+      .filter((x) => x.secJst < curSec)
+      .sort((a, b) => b.secJst - a.secJst)[0] ||
+    ({ ...prevDef, ...getSolarTermCached(boundaryTimeYearGuess(boundary, -1), prevDef.angle, precision) });
 
   // next: curより必ず大きい sec を探す
-  const nextCand = [
-    { def: nextDef, year: boundaryTimeYearGuess(boundary, -1) },
-    { def: nextDef, year: boundaryTimeYearGuess(boundary, 0) },
-    { def: nextDef, year: boundaryTimeYearGuess(boundary, +1) },
-  ].map(({ def, year }) => ({ ...def, ...getSolarTermCached(year, def.angle, precision) }))
-   .filter((x) => x.secJst > curSec)
-   .sort((a, b) => a.secJst - b.secJst)[0] || ({ ...nextDef, ...getSolarTermCached(boundaryTimeYearGuess(boundary, +1), nextDef.angle, precision) });
+  const nextCand =
+    [
+      { def: nextDef, year: boundaryTimeYearGuess(boundary, -1) },
+      { def: nextDef, year: boundaryTimeYearGuess(boundary, 0) },
+      { def: nextDef, year: boundaryTimeYearGuess(boundary, +1) },
+    ]
+      .map(({ def, year }) => ({ ...def, ...getSolarTermCached(year, def.angle, precision) }))
+      .filter((x) => x.secJst > curSec)
+      .sort((a, b) => a.secJst - b.secJst)[0] ||
+    ({ ...nextDef, ...getSolarTermCached(boundaryTimeYearGuess(boundary, +1), nextDef.angle, precision) });
 
   return {
     prev: { name: prevCand.name, angle: prevCand.angle, timeJst: prevCand.timeJst, timeJstSec: prevCand.timeJstSec, secJst: prevCand.secJst },
@@ -680,18 +693,8 @@ function boundaryTimeYearGuess(boundary, add) {
   return (Number.isFinite(y) ? y : 2000) + add;
 }
 
-function buildDiffObject(secSigned) {
-  const label = secSigned === 0 ? "境界同刻" : (secSigned > 0 ? "直後(+)" : "直前(-)");
-  return {
-    seconds: secSigned,
-    minutes: round2(secSigned / 60),
-    days: round6(secSigned / 86400),
-    label,
-  };
-}
-function round6(x) { return Math.round(x * 1_000_000) / 1_000_000; }
-
-// ✅ 追加：monthBoundaryCheck の構築（diff追加）
+// ✅ 追加：monthBoundaryCheck の構築
+// ✅ B（diff追加）：境界からの差分（秒/分/日）も追加
 function buildMonthBoundaryCheck({ std, used, precision, tieBreak, boundary }) {
   const stdSec = toJstSeconds(std);
   const usedSec = toJstSeconds(used);
@@ -702,18 +705,63 @@ function buildMonthBoundaryCheck({ std, used, precision, tieBreak, boundary }) {
 
   const pn = getPrevNextSekki(boundary, precision);
 
-  const diffStd = stdSec - bSec;
-  const diffUsed = usedSec - bSec;
+  // ---- B: diff calculation helpers ----
+  const buildDiff = (tSec, boundarySec) => {
+    const diffSec = tSec - boundarySec; // 正: 境界より後 / 負: 境界より前
+    const absSec = Math.abs(diffSec);
+
+    const diffMin = diffSec / 60;
+    const diffDay = diffSec / 86400;
+
+    let label = "just";
+    if (diffSec < 0) label = "before";
+    if (diffSec > 0) label = "after";
+
+    // 人間が見やすい代表値（丸め）
+    const absMin = absSec / 60;
+    const absDay = absSec / 86400;
+
+    let human = "";
+    if (absSec < 60) human = `${absSec}秒`;
+    else if (absMin < 60) human = `${Math.round(absMin)}分`;
+    else if (absDay < 2) human = `${(absDay).toFixed(2)}日`;
+    else human = `${Math.round(absDay)}日`;
+
+    return {
+      label,               // "before" | "after" | "just"
+      diffSec,             // 符号付き 秒
+      diffMin,             // 符号付き 分（小数）
+      diffDay,             // 符号付き 日（小数）
+      absSec,              // 絶対値 秒
+      absMin,              // 絶対値 分
+      absDay,              // 絶対値 日
+      human,               // UI表示用の短い文字
+    };
+  };
+
+  const stdDiff = buildDiff(stdSec, bSec);
+  const usedDiff = buildDiff(usedSec, bSec);
 
   return {
     standardIsBeforeMonthBoundary,
     usedIsBeforeMonthBoundary,
+
+    // ---- time strings ----
     standardTimeJst: `${std.y}-${pad2(std.m)}-${pad2(std.d)} ${formatHM(std.hh, std.mm)}`,
     usedTimeJst: `${used.y}-${pad2(used.m)}-${pad2(used.d)} ${formatHM(used.hh, used.mm)}`,
+
     boundaryName: boundary.name,
     boundaryAngle: boundary.angle,
     boundaryTimeJst: boundary.timeJst,
-    ...(precision === "second" ? { boundaryTimeJstSec: boundary.timeJstSec } : {}),
+
+    ...(precision === "second"
+      ? { boundaryTimeJstSec: boundary.timeJstSec }
+      : {}),
+
+    // ---- B: diff fields (UIで直前/直後を数値で表示) ----
+    standardDiffFromBoundary: stdDiff,
+    usedDiffFromBoundary: usedDiff,
+
     prevBoundary: {
       name: pn.prev.name,
       angle: pn.prev.angle,
@@ -725,10 +773,6 @@ function buildMonthBoundaryCheck({ std, used, precision, tieBreak, boundary }) {
       angle: pn.next.angle,
       timeJst: pn.next.timeJst,
       ...(precision === "second" ? { timeJstSec: pn.next.timeJstSec } : {}),
-    },
-    diff: {
-      standard: buildDiffObject(diffStd),
-      used: buildDiffObject(diffUsed),
     },
   };
 }
