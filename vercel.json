@@ -11,3 +11,8 @@
     }
   ]
 }
+{
+  "functions": {
+    "api/ai-user-advice.js": { "maxDuration": 60 }
+  }
+}
