@@ -53,6 +53,13 @@ export default async function handler(req, res) {
     const body =
       req.body && typeof req.body === "object" ? req.body : await readJsonBody(req);
 
+
+// ✅ 追加：疎通確認用（OpenAIを呼ばず即返し）
+if (body?.ping === true) {
+  res.statusCode = 200;
+  return res.end(JSON.stringify({ ok: true, pong: true, time: new Date().toISOString() }));
+}
+
     const result = body?.result;
     if (!result || typeof result !== "object") {
       throw new Error("Invalid body: expected { result: {...} }");
