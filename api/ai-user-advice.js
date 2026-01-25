@@ -15,6 +15,10 @@
  * - try の外で必ずCORSヘッダを付与
  * - OPTIONS（preflight）を最優先で200返却
  * - GETで疎通確認できる診断レスポンス追加
+ *
+ * ✅ 安定化（今回追加）:
+ * - ping:true で OpenAI を呼ばず即返却（疎通確認）
+ * - OpenAI 呼び出しにタイムアウトを入れて無限pendingを防止
  */
 
 export default async function handler(req, res) {
@@ -53,12 +57,11 @@ export default async function handler(req, res) {
     const body =
       req.body && typeof req.body === "object" ? req.body : await readJsonBody(req);
 
-
-// ✅ 追加：疎通確認用（OpenAIを呼ばず即返し）
-if (body?.ping === true) {
-  res.statusCode = 200;
-  return res.end(JSON.stringify({ ok: true, pong: true, time: new Date().toISOString() }));
-}
+    // ✅ 追加：疎通確認用（OpenAIを呼ばず即返し）
+    if (body?.ping === true) {
+      res.statusCode = 200;
+      return res.end(JSON.stringify({ ok: true, pong: true, time: new Date().toISOString() }));
+    }
 
     const result = body?.result;
     if (!result || typeof result !== "object") {
@@ -215,10 +218,16 @@ function simplifyPillar(p) {
 
 // ------------------------------
 // OpenAI caller (Responses -> fallback Chat Completions)
+//   ✅ タイムアウト付き（無限pending防止）
 // ------------------------------
 async function callOpenAIText({ apiKey, model, temperature, prompt }) {
-  // 1) Responses API
+  const TIMEOUT_MS = 25000; // 長文なら 35000 でもOK
+
+  // 1) Responses API（タイムアウト付き）
   try {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
     const r = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
@@ -230,7 +239,10 @@ async function callOpenAIText({ apiKey, model, temperature, prompt }) {
         input: prompt,
         temperature,
       }),
+      signal: controller.signal,
     });
+
+    clearTimeout(t);
 
     if (r.ok) {
       const j = await r.json();
@@ -238,33 +250,52 @@ async function callOpenAIText({ apiKey, model, temperature, prompt }) {
         (typeof j?.output_text === "string" && j.output_text) ||
         extractTextFromResponses(j);
       if (txt) return txt.trim();
+    } else {
+      const errTxt = await r.text().catch(() => "");
+      throw new Error(`Responses API HTTP ${r.status} ${errTxt}`.slice(0, 300));
     }
-  } catch (_) {}
-
-  // 2) Chat Completions fallback
-  const r2 = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      temperature,
-      messages: [
-        { role: "system", content: "You are a helpful assistant." },
-        { role: "user", content: prompt },
-      ],
-    }),
-  });
-
-  const j2 = await r2.json().catch(() => ({}));
-  if (!r2.ok) {
-    throw new Error(j2?.error?.message || "OpenAI API failed");
+  } catch (_) {
+    // fallbackへ
   }
-  const txt = j2?.choices?.[0]?.message?.content;
-  if (!txt) throw new Error("OpenAI returned empty text");
-  return String(txt).trim();
+
+  // 2) Chat Completions fallback（タイムアウト付き）
+  const controller2 = new AbortController();
+  const t2 = setTimeout(() => controller2.abort(), TIMEOUT_MS);
+
+  try {
+    const r2 = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        temperature,
+        messages: [
+          { role: "system", content: "You are a helpful assistant." },
+          { role: "user", content: prompt },
+        ],
+      }),
+      signal: controller2.signal,
+    });
+
+    clearTimeout(t2);
+
+    const j2 = await r2.json().catch(() => ({}));
+    if (!r2.ok) {
+      throw new Error(j2?.error?.message || `OpenAI API failed (HTTP ${r2.status})`);
+    }
+    const txt = j2?.choices?.[0]?.message?.content;
+    if (!txt) throw new Error("OpenAI returned empty text");
+    return String(txt).trim();
+  } catch (e) {
+    clearTimeout(t2);
+    if (String(e?.name) === "AbortError") {
+      throw new Error("OpenAI timeout（生成に時間がかかりすぎました。再試行してください）");
+    }
+    throw e;
+  }
 }
 
 function extractTextFromResponses(j) {
@@ -280,5 +311,5 @@ function extractTextFromResponses(j) {
       }
     }
   }
- return parts.join("\n");
+  return parts.join("\n");
 }
