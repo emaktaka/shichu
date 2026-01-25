@@ -1,27 +1,4 @@
 /**
-export default async function handler(req, res) {
-  // tryの外で必ずCORS
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.setHeader("Access-Control-Allow-Origin", "https://saw.anjyanen.com");
-  res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS,GET");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  res.setHeader("Access-Control-Max-Age", "86400");
-
-  if (req.method === "OPTIONS") {
-    res.statusCode = 200;
-    return res.end(JSON.stringify({ ok: true }));
-  }
-
-  // （GET診断を残すならここ）
-  if (req.method === "GET") {
-    res.statusCode = 200;
-    return res.end(JSON.stringify({ ok: true, route: "/api/ai-user-advice", deployed: true }));
-  }
-
-  // ここから下は既存のtry/catchと本文
-  ...
-}
-
  * Vercel Serverless Function (ESM)
  * /api/ai-user-advice
  *
@@ -34,8 +11,8 @@ export default async function handler(req, res) {
  * - OpenAI: Responses APIを優先、失敗時Chat Completionsへフォールバック
  * - 例外は必ず {ok:false,error} で返す
  *
- * ✅ CORS強化（今回の追加）:
- * - try の外で必ずCORSヘッダを付与（404/例外時もヘッダが落ちにくい）
+ * ✅ CORS強化:
+ * - try の外で必ずCORSヘッダを付与
  * - OPTIONS（preflight）を最優先で200返却
  * - GETで疎通確認できる診断レスポンス追加
  */
@@ -43,11 +20,7 @@ export default async function handler(req, res) {
 export default async function handler(req, res) {
   // ✅ CORSヘッダ：どんな応答でも最初に付ける（tryの外）
   res.setHeader("Content-Type", "application/json; charset=utf-8");
-
-  // ★ 固定オリジン（今回のWordPressドメイン）
-  // もし将来サブドメインや別ドメインでも使うなら "*" に戻してOK
   res.setHeader("Access-Control-Allow-Origin", "https://saw.anjyanen.com");
-
   res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS,GET");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.setHeader("Access-Control-Max-Age", "86400");
@@ -58,8 +31,7 @@ export default async function handler(req, res) {
     return res.end(JSON.stringify({ ok: true }));
   }
 
-  // ✅ GETで疎通確認できるようにする（CORS/ルーティング診断）
-  // ブラウザで直接URLを開いてJSONが返れば「関数がデプロイされている」が確定
+  // ✅ GETで疎通確認（ブラウザで開いてOKならデプロイ確認が可能）
   if (req.method === "GET") {
     res.statusCode = 200;
     return res.end(
@@ -105,7 +77,6 @@ export default async function handler(req, res) {
     res.statusCode = 200;
     return res.end(JSON.stringify({ ok: true, text: finalText }));
   } catch (e) {
-    // ✅ エラーでもCORSヘッダは既に付いている
     res.statusCode = 200;
     return res.end(JSON.stringify({ ok: false, error: String(e?.message || e) }));
   }
@@ -302,5 +273,5 @@ function extractTextFromResponses(j) {
       }
     }
   }
-  return parts.join("\n");
+ return parts.join("\n");
 }
