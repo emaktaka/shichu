@@ -19,14 +19,35 @@
  * ✅ 安定化（今回追加）:
  * - ping:true で OpenAI を呼ばず即返却（疎通確認）
  * - OpenAI 呼び出しにタイムアウトを入れて無限pendingを防止
+ *
+ * ✅ Safari対策（今回修正）:
+ * - Access-Control-Allow-Origin を固定せず、Originに合わせて返す（or *）
+ * - Allow-Headers に Accept を含める（preflight不一致対策）
  */
 
 export default async function handler(req, res) {
-  // ✅ CORSヘッダ：どんな応答でも最初に付ける（tryの外）
+  // ==============================
+  // ✅ CORS（Safari “Load failed” 対策）
+  // ==============================
+  const origin = req.headers?.origin || "";
+
+  // 許可したいオリジン（必要なら追加）
+  const ALLOWED_ORIGINS = new Set([
+    "https://saw.anjyanen.com",
+    "https://www.saw.anjyanen.com",
+    "https://spikatsu.anjyanen.com",
+    "https://www.spikatsu.anjyanen.com",
+  ]);
+
+  // Originが取れないケースもあるので、その場合は * に逃がす
+  // ※ credentials: "include" を使う予定が無いなら * が一番安全
+  const allowOrigin = ALLOWED_ORIGINS.has(origin) ? origin : "*";
+
   res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.setHeader("Access-Control-Allow-Origin", "https://saw.anjyanen.com");
+  res.setHeader("Access-Control-Allow-Origin", allowOrigin);
+  res.setHeader("Vary", "Origin"); // ✅ CDNsでOrigin別キャッシュ崩れ防止
   res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS,GET");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept");
   res.setHeader("Access-Control-Max-Age", "86400");
 
   // ✅ Preflight（最優先）
@@ -44,6 +65,8 @@ export default async function handler(req, res) {
         route: "/api/ai-user-advice",
         deployed: true,
         time: new Date().toISOString(),
+        originSeen: origin || null,
+        allowOrigin,
       })
     );
   }
