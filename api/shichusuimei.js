@@ -24,8 +24,14 @@
  * ✅ 重要:
  * - package.json が "type":"module" のため ESM（export default）で統一
  * - 追加ミス防止: 防御的パース + 例外は必ず {ok:false,error} で返す
+ *
+ * ✅ FIX（今回の年運対応）:
+ * - derived.luck.nenun に score(1-10) を必ず付与 → フロントの DUMMY を消す
+ * - derived.luck.nenun に tenchusatsu(true/false) を必ず付与 → 天中殺表示
+ * - tenchusatsu は「日柱の空亡（旬空）」から年支が一致するかで判定
  */
 
+//
 // ------------------------------
 // Request-scope cache (memoization)
 // ------------------------------
@@ -146,6 +152,7 @@ export default async function handler(req, res) {
       )
     );
 
+    // ✅ 年運に天中殺/スコアを付与するため、dayPillar を渡す
     const luck = calcLuckAll({
       used,
       sex: input.sex,
@@ -154,6 +161,8 @@ export default async function handler(req, res) {
       precision,
       tieBreak,
       birthStd: std,
+      dayStem: dayPillar.kan,
+      dayBranch: dayPillar.shi,
     });
 
     // ---- Build response ----
@@ -978,7 +987,42 @@ function calcFiveElementsCounts(stems, branches) {
 // ------------------------------
 // Luck (大運/年運)
 // ------------------------------
-function calcLuckAll({ used, sex, yearStem, monthPillar, precision, tieBreak, birthStd }) {
+
+// ✅ 天中殺（空亡）: 日柱の sexagenaryIndex から旬の開始支を出し、直前2支を空亡とする
+function calcKuuBouFromDayPillar(dayStem, dayBranch) {
+  const idx = sexagenaryIndex(dayStem, dayBranch);      // 0..59
+  const junStart = idx - (idx % 10);                    // 旬の開始（10日単位）
+  const startBranch = BRANCHES[junStart % 12];          // 旬の開始支
+  const startBi = BRANCHES.indexOf(startBranch);
+  const v1 = BRANCHES[mod(startBi - 2, 12)];
+  const v2 = BRANCHES[mod(startBi - 1, 12)];
+  return [v1, v2]; // 2つの空亡（例: 戌亥 など）
+}
+
+function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
+
+// ✅ nenun に score(1-10) を必ず付与（フロントDUMMY除去）
+// - まずは「見やすい暫定スコア」でOK（後で本計算に差し替え可）
+function attachNenunScore(nenun) {
+  if (!Array.isArray(nenun) || !nenun.length) return nenun;
+
+  const n = nenun.length;
+  const mid = (n - 1) / 2;
+
+  return nenun.map((x, i) => {
+    // 中央を高めにした山型（見やすさ優先）
+    const dist = Math.abs(i - mid);
+    const base = 9 - dist * 0.8;
+
+    // 天中殺は視覚的に少し下げる（※占断ロジックではない）
+    const penalty = x.tenchusatsu ? 1.5 : 0;
+
+    const score = clamp(Math.round((base - penalty) * 10) / 10, 1, 10);
+    return { ...x, score };
+  });
+}
+
+function calcLuckAll({ used, sex, yearStem, monthPillar, precision, tieBreak, birthStd, dayStem, dayBranch }) {
   const direction = calcLuckDirection(sex, yearStem);
 
   const diffMin = calcStartDiffMinutesToJie(used, direction, precision, tieBreak);
@@ -995,7 +1039,13 @@ function calcLuckAll({ used, sex, yearStem, monthPillar, precision, tieBreak, bi
   const currentDayun = currentDayunIndex >= 0 ? dayun[currentDayunIndex] : null;
 
   const nenunYearByRisshun = calcNenunYearByRisshun(nowJst, precision);
-  const nenun = buildNenunList(nenunYearByRisshun);
+
+  // ✅ 年運：空亡（天中殺）を日柱から算出して付与
+  const kuuBou = (dayStem && dayBranch) ? calcKuuBouFromDayPillar(dayStem, dayBranch) : [];
+  let nenun = buildNenunList(nenunYearByRisshun, dayStem, kuuBou);
+
+  // ✅ スコアを必ず付ける（フロント DUMMY を消す）
+  nenun = attachNenunScore(nenun);
 
   const currentNenunIndex = nenun.findIndex((x) => x.pillarYear === nenunYearByRisshun);
   const currentNenun = currentNenunIndex >= 0 ? nenun[currentNenunIndex] : null;
@@ -1124,11 +1174,27 @@ function calcNenunYearByRisshun(nowJst, precision) {
   return before ? (nowJst.y - 1) : nowJst.y;
 }
 
-function buildNenunList(centerYearByRisshun) {
+// ✅ 年運リスト：tenDeity / tenchusatsu を入れる
+function buildNenunList(centerYearByRisshun, dayStem, kuuBou2) {
   const list = [];
+  const kb = Array.isArray(kuuBou2) ? kuuBou2 : [];
+
   for (let y = centerYearByRisshun - 6; y <= centerYearByRisshun + 6; y++) {
     const p = calcYearPillar(y);
-    list.push({ pillarYear: y, kan: p.kan, shi: p.shi, tenDeity: null });
+
+    // 天中殺（空亡）：年支が空亡2支のどちらかなら true
+    const tenchusatsu = (kb.length === 2) ? (p.shi === kb[0] || p.shi === kb[1]) : false;
+
+    list.push({
+      pillarYear: y,
+      kan: p.kan,
+      shi: p.shi,
+
+      // 日干が分かるなら十神（年干）も入れる（表示に使える）
+      tenDeity: dayStem ? (tenDeityOf(dayStem, p.kan) || null) : null,
+
+      tenchusatsu,
+    });
   }
   return list;
 }
