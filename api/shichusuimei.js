@@ -1,29 +1,46 @@
-// ===== /api/shichusuimei.js : Part 1/3 =====
+// /api/shichusuimei.js
 /**
- * Magic Wands 準拠・暦ベース四柱推命エンジン
+ * Magic Wands 準拠・暦ベース四柱推命エンジン（名刺＝柱ズレ防止版）
  *
  * 方針：
- * - 天文計算・秒単位節入りは使用しない
- * - 年柱：立春「日」基準（2/4）
- * - 月柱：節「日」基準（時刻無視）
- * - 日柱：23時切替固定
+ * - 天文計算・秒単位節入りは使用しない（節入り“日”で固定）
+ * - 年柱：立春「日」基準（2/4） ※時刻無視
+ * - 月柱：節「日」基準（時刻無視 / Magic準拠）
+ * - 日柱：23時切替固定（JST）
  * - 時柱：JSTそのまま
  * - 「命式は原則ズレない」思想に準拠
  *
- * 出力JSON構造は既存APIと互換
+ * 出力：
+ * - 既存API互換のため input/meta/pillars/derived を返す
  */
 
 export default async function handler(req, res) {
   try {
+    // ---- CORS / basics ----
     res.setHeader("Content-Type", "application/json; charset=utf-8");
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
+    res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS,GET");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
     if (req.method === "OPTIONS") {
       res.statusCode = 200;
       return res.end(JSON.stringify({ ok: true }));
     }
+
+    // ✅ GET 疎通確認
+    if (req.method === "GET") {
+      res.statusCode = 200;
+      return res.end(
+        JSON.stringify({
+          ok: true,
+          route: "/api/shichusuimei",
+          deployed: true,
+          mode: "magic_wands_calendar_fixed",
+          time: new Date().toISOString(),
+        })
+      );
+    }
+
     if (req.method !== "POST") {
       res.statusCode = 405;
       return res.end(JSON.stringify({ ok: false, error: "Method Not Allowed" }));
@@ -33,31 +50,70 @@ export default async function handler(req, res) {
       req.body && typeof req.body === "object" ? req.body : await readJsonBody(req);
 
     const input = normalizeInput(body);
-
     const std = parseJstDateTime(input.date, input.time);
 
-    // --- 年柱（立春 2/4 基準・日単位） ---
+    // --- 年柱（立春 2/4 基準・日単位・時刻無視） ---
     const yearForPillar = isBeforeDate(std, { m: 2, d: 4 }) ? std.y - 1 : std.y;
     const yearPillar = calcYearPillar(yearForPillar);
 
-    // --- 月柱（節「日」基準・Magic準拠） ---
-    // ✅ 修正2：年またぎ（1/1〜1/5は「子月」＝12/7境界を採用）を保証
+    // --- 月柱（節「日」基準・Magic準拠・時刻無視） ---
     const monthBoundary = getMonthBoundaryByDate(std);
     const monthPillar = calcMonthPillarFromBoundary(monthBoundary, yearPillar.kan);
 
-    // --- 日柱（23時切替） ---
+    // --- 日柱（23時切替固定） ---
     const dayPillar = calcDayPillar23(std);
 
-    // --- 時柱 ---
+    // --- 時柱（入力時刻がある時のみ） ---
     const hourPillar = input.time ? calcHourPillar(std, dayPillar.kan) : null;
+
+    // ---- Derived（鑑定に使う“名刺の読み解き”） ----
+    const tenDeity = calcTenDeity(
+      yearPillar.kan,
+      monthPillar.kan,
+      dayPillar.kan,
+      hourPillar?.kan
+    );
+
+    const zokanTenDeity = calcZokanTenDeity(
+      yearPillar.shi,
+      monthPillar.shi,
+      dayPillar.shi,
+      hourPillar?.shi,
+      dayPillar.kan
+    );
+
+    const fiveElements = calcFiveElementsCounts(
+      [yearPillar.kan, monthPillar.kan, dayPillar.kan].concat(
+        hourPillar?.kan ? [hourPillar.kan] : []
+      ),
+      [yearPillar.shi, monthPillar.shi, dayPillar.shi].concat(
+        hourPillar?.shi ? [hourPillar.shi] : []
+      )
+    );
+
+    const luck = calcLuckAll({
+      birthStd: std,
+      sex: normalizeSex(input.sex),
+      yearStem: yearPillar.kan,
+      monthPillar,
+      dayStem: dayPillar.kan,
+      dayBranch: dayPillar.shi,
+    });
 
     const resp = {
       ok: true,
       input: {
         date: input.date,
         time: input.time,
-        sex: input.sex,
+        sex: normalizeSex(input.sex) || "",
         birthPlace: input.birthPlace,
+
+        // ✅ 互換用（フロントが参照しても破綻しない固定値）
+        timeMode: "standard",
+        dayBoundaryMode: "23",
+        boundaryTimeRef: "standard",
+        sekkiBoundaryPrecision: "day",
+        sekkiBoundaryTieBreak: "after",
       },
       meta: {
         standard: {
@@ -67,21 +123,45 @@ export default async function handler(req, res) {
           time: formatHM(std.hh, std.mm),
         },
         used: {
+          // Magic思想：used=standard（補正無し）
           y: std.y,
           m: std.m,
           d: std.d,
           time: formatHM(std.hh, std.mm),
+
           yearPillarYearUsed: yearForPillar,
-          monthBoundary: monthBoundary,
+          monthBoundary: {
+            name: monthBoundary.name,
+            angle: monthBoundary.angle,
+            timeJst: `${std.y}-${pad2(monthBoundary.m)}-${pad2(monthBoundary.d)} 00:00`,
+            // “日基準”なので時刻は 00:00 固定表現
+          },
+
+          // ✅ 立春も “日基準” として明示
+          yearBoundary: {
+            name: "立春",
+            timeJst: `${std.y}-${pad2(2)}-${pad2(4)} 00:00`,
+          },
+        },
+        place: {
+          // 互換枠（Magic思想では計算に未使用）
+          country: input.birthPlace?.country || "JP",
+          pref: input.birthPlace?.pref || "東京都",
         },
       },
       pillars: {
-        year: { ...yearPillar, zokan: getZokan(yearPillar.shi) },
-        month: { ...monthPillar, zokan: getZokan(monthPillar.shi) },
-        day: { ...dayPillar, zokan: getZokan(dayPillar.shi) },
+        year: { ...yearPillar, zokan: getZokan(yearPillar.shi), rule: "magic_risshun_date" },
+        month: { ...monthPillar, zokan: getZokan(monthPillar.shi), rule: "magic_jie_date" },
+        day: { ...dayPillar, zokan: getZokan(dayPillar.shi), rule: "day_boundary_23_fixed" },
         hour: hourPillar
-          ? { ...hourPillar, zokan: getZokan(hourPillar.shi) }
+          ? { ...hourPillar, zokan: getZokan(hourPillar.shi), rule: "hour_jst" }
           : null,
+      },
+      derived: {
+        tenDeity,
+        zokanTenDeity,
+        fiveElements,
+        luck,
       },
     };
 
@@ -94,7 +174,7 @@ export default async function handler(req, res) {
 }
 
 // ------------------------------
-// utils / input
+// Body utils / input
 // ------------------------------
 function readJsonBody(req) {
   return new Promise((resolve, reject) => {
@@ -114,28 +194,39 @@ function readJsonBody(req) {
 
 function normalizeInput(body) {
   const date = safeString(body?.date);
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error("Invalid date");
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error("Invalid date (expected YYYY-MM-DD)");
 
   const timeRaw = safeString(body?.time);
-  if (timeRaw && !/^\d{2}:\d{2}(:\d{2})?$/.test(timeRaw))
-    throw new Error("Invalid time");
+  if (timeRaw && !/^\d{2}:\d{2}(:\d{2})?$/.test(timeRaw)) {
+    throw new Error("Invalid time (expected HH:MM or HH:MM:SS)");
+  }
 
   const sex = safeString(body?.sex);
   const birthPlace =
-    body?.birthPlace && typeof body.birthPlace === "object"
-      ? body.birthPlace
-      : { country: "JP", pref: "東京都" };
+    body?.birthPlace && typeof body.birthPlace === "object" ? body.birthPlace : {};
+
+  const country = safeString(birthPlace.country) || "JP";
+  const pref = safeString(birthPlace.pref) || "東京都";
 
   return {
     date,
     time: timeRaw || "",
     sex,
-    birthPlace,
+    birthPlace: { country, pref },
   };
 }
 
 function safeString(v) {
   return typeof v === "string" ? v.trim() : "";
+}
+
+function normalizeSex(sex) {
+  const s = safeString(sex).toUpperCase();
+  if (s === "M" || s === "F") return s;
+  // "男性"/"女性" も許容
+  if (sex === "男性") return "M";
+  if (sex === "女性") return "F";
+  return "";
 }
 
 // ------------------------------
@@ -171,8 +262,8 @@ function formatHM(h, m) {
 // ------------------------------
 // Sexagenary basics
 // ------------------------------
-const STEMS = ["甲","乙","丙","丁","戊","己","庚","辛","壬","癸"];
-const BRANCHES = ["子","丑","寅","卯","辰","巳","午","未","申","酉","戌","亥"];
+const STEMS = ["甲", "乙", "丙", "丁", "戊", "己", "庚", "辛", "壬", "癸"];
+const BRANCHES = ["子", "丑", "寅", "卯", "辰", "巳", "午", "未", "申", "酉", "戌", "亥"];
 
 function mod(a, m) {
   return ((a % m) + m) % m;
@@ -188,42 +279,34 @@ function calcYearPillar(year) {
 }
 
 // ------------------------------
-// Month (Magic-style fixed boundaries)
+// Month (Magic-style fixed boundaries by DATE)
 // ------------------------------
+// ※ MagicWands の “節入り日” に合わせる：ここは「日付固定」なので原則ズレない
 const MONTH_BOUNDARIES = [
   { m: 2, d: 4, angle: 315, name: "立春", branch: "寅" },
   { m: 3, d: 6, angle: 345, name: "啓蟄", branch: "卯" },
-  { m: 4, d: 5, angle: 15,  name: "清明", branch: "辰" },
-  { m: 5, d: 6, angle: 45,  name: "立夏", branch: "巳" },
-  { m: 6, d: 6, angle: 75,  name: "芒種", branch: "午" },
+  { m: 4, d: 5, angle: 15, name: "清明", branch: "辰" },
+  { m: 5, d: 6, angle: 45, name: "立夏", branch: "巳" },
+  { m: 6, d: 6, angle: 75, name: "芒種", branch: "午" },
   { m: 7, d: 7, angle: 105, name: "小暑", branch: "未" },
   { m: 8, d: 8, angle: 135, name: "立秋", branch: "申" },
   { m: 9, d: 8, angle: 165, name: "白露", branch: "酉" },
-  { m:10, d: 8, angle: 195, name: "寒露", branch: "戌" },
-  { m:11, d: 7, angle: 225, name: "立冬", branch: "亥" },
-  // ✅ MagicWands 寄せ：12/7 で「子月」へ（節名は大雪でOK）
-  { m:12, d: 7, angle: 255, name: "大雪", branch: "子" },
-  // ✅ 1/6 で「丑月」へ
+  { m: 10, d: 8, angle: 195, name: "寒露", branch: "戌" },
+  { m: 11, d: 7, angle: 225, name: "立冬", branch: "亥" },
+  { m: 12, d: 7, angle: 255, name: "大雪", branch: "子" },
   { m: 1, d: 6, angle: 285, name: "小寒", branch: "丑" },
 ];
 
 function getMonthBoundaryByDate(std) {
-  // ✅ 修正2（決定版）：
-  // 1/1〜1/5 は「前年 12/7（子月）」扱いにする（ここがズレの最大原因）
-  if (std.m === 1 && std.d < 6) {
-    // 12/7 境界（子月）を返す
-    return MONTH_BOUNDARIES.find((b) => b.m === 12 && b.d === 7) || MONTH_BOUNDARIES[MONTH_BOUNDARIES.length - 1];
-  }
-
-  // 通常は「その日付以前の境界のうち最も新しいもの」を採用
   let best = null;
-  for (const b of MONTH_BOUNDARIES) {
-    const hit = std.m > b.m || (std.m === b.m && std.d >= b.d);
-    if (hit) best = b;
-  }
 
-  // 2/1〜2/3 等で best が 1/6（丑）になるのは正しい
-  if (!best) best = MONTH_BOUNDARIES[MONTH_BOUNDARIES.length - 1];
+  // 「その年の 1/6 以降は小寒」を含むため、単純比較だと年跨ぎで難しい
+  // 方針：まず同一年内の候補を走査し、見つからなければ「前年の小寒」を採用
+  for (const b of MONTH_BOUNDARIES) {
+    const before = std.m > b.m || (std.m === b.m && std.d >= b.d);
+    if (before) best = b;
+  }
+  if (!best) best = MONTH_BOUNDARIES[MONTH_BOUNDARIES.length - 1]; // 小寒
   return best;
 }
 
@@ -235,24 +318,32 @@ function calcMonthPillarFromBoundary(boundary, yearStem) {
 
 function monthStemFromYearStem(yearStem, monthBranch) {
   const startMap = {
-    "甲":"丙","己":"丙",
-    "乙":"戊","庚":"戊",
-    "丙":"庚","辛":"庚",
-    "丁":"壬","壬":"壬",
-    "戊":"甲","癸":"甲",
+    "甲": "丙",
+    "己": "丙",
+    "乙": "戊",
+    "庚": "戊",
+    "丙": "庚",
+    "辛": "庚",
+    "丁": "壬",
+    "壬": "壬",
+    "戊": "甲",
+    "癸": "甲",
   };
-  const order = ["寅","卯","辰","巳","午","未","申","酉","戌","亥","子","丑"];
+  const order = ["寅", "卯", "辰", "巳", "午", "未", "申", "酉", "戌", "亥", "子", "丑"];
   const startStem = startMap[yearStem] || "丙";
   const k = order.indexOf(monthBranch);
   const startIdx = STEMS.indexOf(startStem);
-  return STEMS[mod(startIdx + k, 10)];
+  return STEMS[mod(startIdx + (k < 0 ? 0 : k), 10)];
 }
 
 // ------------------------------
 // Day / Hour (23時切替)
 // ------------------------------
 function calcDayPillar23(std) {
-  let y = std.y, m = std.m, d = std.d;
+  let y = std.y,
+    m = std.m,
+    d = std.d;
+
   if (std.hh >= 23) {
     const dt = new Date(Date.UTC(y, m - 1, d));
     const n = new Date(dt.getTime() + 86400000);
@@ -260,8 +351,9 @@ function calcDayPillar23(std) {
     m = n.getUTCMonth() + 1;
     d = n.getUTCDate();
   }
+
   const jdn = julianDayNumber(y, m, d);
-  const idx = mod(jdn + 49, 60); // Magic基準合わせ
+  const idx = mod(jdn + 49, 60); // ✅ Magic基準合わせ（あなたの検証値に合わせる）
   return sexagenaryFromIndex(idx);
 }
 
@@ -270,59 +362,82 @@ function calcHourPillar(std, dayStem) {
   let idx;
   if (t >= 23 * 60) idx = 0;
   else idx = Math.floor((t + 60) / 120);
-  const branch = BRANCHES[mod(idx, 12)];
 
-  const startMap = {
-    "甲":"甲","己":"甲",
-    "乙":"丙","庚":"丙",
-    "丙":"戊","辛":"戊",
-    "丁":"庚","壬":"庚",
-    "戊":"壬","癸":"壬",
-  };
-  const startStem = startMap[dayStem] || "甲";
-  const startIdx = STEMS.indexOf(startStem);
-  const k = BRANCHES.indexOf(branch);
-  const stem = STEMS[mod(startIdx + k, 10)];
+  const branch = BRANCHES[mod(idx, 12)];
+  const stem = hourStemFromDayStem(dayStem, branch);
   return { kan: stem, shi: branch };
 }
 
-// ------------------------------
+function hourStemFromDayStem(dayStem, hourBranch) {
+  const startMap = {
+    "甲": "甲",
+    "己": "甲",
+    "乙": "丙",
+    "庚": "丙",
+    "丙": "戊",
+    "辛": "戊",
+    "丁": "庚",
+    "壬": "庚",
+    "戊": "壬",
+    "癸": "壬",
+  };
+  const startStem = startMap[dayStem] || "甲";
+  const startIdx = STEMS.indexOf(startStem);
+  const k = BRANCHES.indexOf(hourBranch);
+  return STEMS[mod(startIdx + (k < 0 ? 0 : k), 10)];
+}
+
 function julianDayNumber(y, m, d) {
   const a = Math.floor((14 - m) / 12);
   const y2 = y + 4800 - a;
   const m2 = m + 12 * a - 3;
-  return d + Math.floor((153 * m2 + 2) / 5) + 365 * y2 +
-    Math.floor(y2 / 4) - Math.floor(y2 / 100) +
-    Math.floor(y2 / 400) - 32045;
+  return (
+    d +
+    Math.floor((153 * m2 + 2) / 5) +
+    365 * y2 +
+    Math.floor(y2 / 4) -
+    Math.floor(y2 / 100) +
+    Math.floor(y2 / 400) -
+    32045
+  );
 }
 
 // ------------------------------
-// Hidden stems (stub,続きはPart2)
+// Hidden stems (蔵干)
 // ------------------------------
+const ZOKAN = {
+  子: ["癸"],
+  丑: ["己", "癸", "辛"],
+  寅: ["甲", "丙", "戊"],
+  卯: ["乙"],
+  辰: ["戊", "乙", "癸"],
+  巳: ["丙", "戊", "庚"],
+  午: ["丁", "己"],
+  未: ["己", "丁", "乙"],
+  申: ["庚", "壬", "戊"],
+  酉: ["辛"],
+  戌: ["戊", "辛", "丁"],
+  亥: ["壬", "甲"],
+};
+
 function getZokan(branch) {
-  const Z = {
-    "子":["癸"], "丑":["己","癸","辛"], "寅":["甲","丙","戊"], "卯":["乙"],
-    "辰":["戊","乙","癸"], "巳":["丙","戊","庚"], "午":["丁","己"], "未":["己","丁","乙"],
-    "申":["庚","壬","戊"], "酉":["辛"], "戌":["戊","辛","丁"], "亥":["壬","甲"],
-  };
-  return Z[branch] ? [...Z[branch]] : [];
+  return ZOKAN[branch] ? [...ZOKAN[branch]] : [];
 }
-// ===== /api/shichusuimei.js : Part 2/3 =====
 
 // ------------------------------
 // Ten Deity（通変星）
 // ------------------------------
 const STEM_INFO = {
-  "甲": { elem: "wood", yin: false },
-  "乙": { elem: "wood", yin: true },
-  "丙": { elem: "fire", yin: false },
-  "丁": { elem: "fire", yin: true },
-  "戊": { elem: "earth", yin: false },
-  "己": { elem: "earth", yin: true },
-  "庚": { elem: "metal", yin: false },
-  "辛": { elem: "metal", yin: true },
-  "壬": { elem: "water", yin: false },
-  "癸": { elem: "water", yin: true },
+  甲: { elem: "wood", yin: false },
+  乙: { elem: "wood", yin: true },
+  丙: { elem: "fire", yin: false },
+  丁: { elem: "fire", yin: true },
+  戊: { elem: "earth", yin: false },
+  己: { elem: "earth", yin: true },
+  庚: { elem: "metal", yin: false },
+  辛: { elem: "metal", yin: true },
+  壬: { elem: "water", yin: false },
+  癸: { elem: "water", yin: true },
 };
 
 function elementRelation(dayElem, otherElem) {
@@ -441,31 +556,16 @@ function calcAgeYears(birth, now) {
 }
 
 // ------------------------------
-// この Part2 では以下を追加しました：
-// - 通変星計算
-// - 蔵干通変星
-// - 五行カウント
-// - 空亡算出
-// - 年齢・現在時刻補助関数
-//
-// 次の Part 3 で：
-// - 大運・歳運（Magic思想）
-// - handler への derived 追加
-// - 最終レスポンス完成
-// ------------------------------
-// ===== /api/shichusuimei.js : Part 3/3 =====
-
-// ------------------------------
 // Luck（大運・歳運：Magic思想）
 // ------------------------------
 function calcLuckAll({ birthStd, sex, yearStem, monthPillar, dayStem, dayBranch }) {
   const direction = calcLuckDirection(sex, yearStem);
 
-  // Magic準拠：出生後「次の節」までの日数 ÷ 3
-  const startAgeYears = calcMagicStartAge(birthStd);
+  // Magic準拠（簡易）：出生後「次の節」までの日数 ÷ 3（概算）
+  const startAgeYearsF = calcMagicStartAge(birthStd);
   const startAgeDetail = {
-    years: Math.floor(startAgeYears),
-    months: Math.round((startAgeYears % 1) * 12),
+    years: Math.floor(startAgeYearsF),
+    months: Math.round((startAgeYearsF % 1) * 12),
     days: 0,
   };
 
@@ -479,19 +579,21 @@ function calcLuckAll({ birthStd, sex, yearStem, monthPillar, dayStem, dayBranch 
 
   const nenunYearByRisshun = isBeforeRisshun(now) ? now.y - 1 : now.y;
   const kuuBou = calcKuuBouFromDayPillar(dayStem, dayBranch);
-  const nenun = buildNenunList(nenunYearByRisshun, dayStem, kuuBou);
 
+  const nenun = attachNenunScore(buildNenunList(nenunYearByRisshun, dayStem, kuuBou));
   const currentNenunIndex = nenun.findIndex((x) => x.pillarYear === nenunYearByRisshun);
   const currentNenun = currentNenunIndex >= 0 ? nenun[currentNenunIndex] : null;
 
   return {
     direction,
-    startAgeYears: Math.floor(startAgeYears),
+    startCalcMode: "magic_next_jie_days_div_3",
+    startDiffMinutes: null,
+    startAgeYears: Math.floor(startAgeYearsF),
     startAgeDetail,
     current: {
       ageYears,
-      currentDayunIndex,
-      currentNenunIndex,
+      currentDayunIndex: currentDayunIndex < 0 ? 0 : currentDayunIndex,
+      currentNenunIndex: currentNenunIndex < 0 ? 0 : currentNenunIndex,
       nenunYearByRisshun,
     },
     dayun,
@@ -509,10 +611,11 @@ function calcLuckDirection(sex, yearStem) {
   return "forward";
 }
 
-// Magic簡易：次の節までの日数（概算）
+// Magic簡易：次の節までの概算（固定の“見やすさ優先”）
+// ※ここは「名刺を揺らさない」ための補助。必要なら後でMagicの正規計算に差し替え可能。
 function calcMagicStartAge(birthStd) {
   const base = new Date(Date.UTC(birthStd.y, birthStd.m - 1, birthStd.d));
-  const approxNext = new Date(base.getTime() + 15 * 86400000);
+  const approxNext = new Date(base.getTime() + 15 * 86400000); // だいたい半月先
   const diffDays = Math.max(1, Math.floor((approxNext - base) / 86400000));
   return diffDays / 3;
 }
@@ -520,7 +623,7 @@ function calcMagicStartAge(birthStd) {
 function isBeforeRisshun(now) {
   if (now.m < 2) return true;
   if (now.m > 2) return false;
-  return now.d < 4;
+  return now.d < 4; // 2/4 未満は前年扱い
 }
 
 function buildDayunList(monthPillar, direction) {
@@ -565,16 +668,22 @@ function buildNenunList(centerYear, dayStem, kuuBou) {
   return list;
 }
 
-// ------------------------------
-// handler 拡張（Part1 に統合済み想定）
-// この Part3 を Part1 の handler 内で以下のように統合してください：
-//
-// const tenDeity = calcTenDeity(...);
-// const zokanTenDeity = calcZokanTenDeity(...);
-// const fiveElements = calcFiveElementsCounts(...);
-// const luck = calcLuckAll({ birthStd: std, sex: input.sex, yearStem: yearPillar.kan, monthPillar, dayStem: dayPillar.kan, dayBranch: dayPillar.shi });
-//
-// resp.derived = { tenDeity, zokanTenDeity, fiveElements, luck };
-//
-// これで Magic Wands 準拠・暦ベース四柱推命APIが完成します。
-// ------------------------------
+function clamp(n, a, b) {
+  return Math.max(a, Math.min(b, n));
+}
+
+// スコア（1-10）を必ず付与：フロントで棒グラフ等に使える
+function attachNenunScore(nenun) {
+  if (!Array.isArray(nenun) || !nenun.length) return nenun;
+
+  const n = nenun.length;
+  const mid = (n - 1) / 2;
+
+  return nenun.map((x, i) => {
+    const dist = Math.abs(i - mid);
+    const base = 9 - dist * 0.8;
+    const penalty = x.tenchusatsu ? 1.5 : 0;
+    const score = clamp(Math.round((base - penalty) * 10) / 10, 1, 10);
+    return { ...x, score };
+  });
+}
