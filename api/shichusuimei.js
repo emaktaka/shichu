@@ -300,15 +300,23 @@ const MONTH_BOUNDARIES = [
 function getMonthBoundaryByDate(std) {
   let best = null;
 
-  // 「その年の 1/6 以降は小寒」を含むため、単純比較だと年跨ぎで難しい
-  // 方針：まず同一年内の候補を走査し、見つからなければ「前年の小寒」を採用
   for (const b of MONTH_BOUNDARIES) {
-    const before = std.m > b.m || (std.m === b.m && std.d >= b.d);
+
+    // ✅ 重要：小寒(1/6)は「1月の時だけ」判定対象にする
+    if (b.m === 1 && std.m !== 1) continue;
+
+    const before =
+      std.m > b.m || (std.m === b.m && std.d >= b.d);
+
     if (before) best = b;
   }
-  if (!best) best = MONTH_BOUNDARIES[MONTH_BOUNDARIES.length - 1]; // 小寒
+
+  // 1月で 1/6 より前なら「前年の大雪(12/7)」扱い
+  if (!best) best = MONTH_BOUNDARIES.find(x => x.m === 12) || MONTH_BOUNDARIES[MONTH_BOUNDARIES.length - 1];
+
   return best;
 }
+
 
 function calcMonthPillarFromBoundary(boundary, yearStem) {
   const monthBranch = boundary.branch;
