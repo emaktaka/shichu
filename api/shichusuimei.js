@@ -41,6 +41,7 @@ export default async function handler(req, res) {
     const yearPillar = calcYearPillar(yearForPillar);
 
     // --- 月柱（節「日」基準・Magic準拠） ---
+    // ✅ 修正2：年またぎ（1/1〜1/5は「子月」＝12/7境界を採用）を保証
     const monthBoundary = getMonthBoundaryByDate(std);
     const monthPillar = calcMonthPillarFromBoundary(monthBoundary, yearPillar.kan);
 
@@ -200,17 +201,28 @@ const MONTH_BOUNDARIES = [
   { m: 9, d: 8, angle: 165, name: "白露", branch: "酉" },
   { m:10, d: 8, angle: 195, name: "寒露", branch: "戌" },
   { m:11, d: 7, angle: 225, name: "立冬", branch: "亥" },
+  // ✅ MagicWands 寄せ：12/7 で「子月」へ（節名は大雪でOK）
   { m:12, d: 7, angle: 255, name: "大雪", branch: "子" },
+  // ✅ 1/6 で「丑月」へ
   { m: 1, d: 6, angle: 285, name: "小寒", branch: "丑" },
 ];
 
 function getMonthBoundaryByDate(std) {
+  // ✅ 修正2（決定版）：
+  // 1/1〜1/5 は「前年 12/7（子月）」扱いにする（ここがズレの最大原因）
+  if (std.m === 1 && std.d < 6) {
+    // 12/7 境界（子月）を返す
+    return MONTH_BOUNDARIES.find((b) => b.m === 12 && b.d === 7) || MONTH_BOUNDARIES[MONTH_BOUNDARIES.length - 1];
+  }
+
+  // 通常は「その日付以前の境界のうち最も新しいもの」を採用
   let best = null;
   for (const b of MONTH_BOUNDARIES) {
-    const before =
-      std.m > b.m || (std.m === b.m && std.d >= b.d);
-    if (before) best = b;
+    const hit = std.m > b.m || (std.m === b.m && std.d >= b.d);
+    if (hit) best = b;
   }
+
+  // 2/1〜2/3 等で best が 1/6（丑）になるのは正しい
   if (!best) best = MONTH_BOUNDARIES[MONTH_BOUNDARIES.length - 1];
   return best;
 }
