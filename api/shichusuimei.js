@@ -249,7 +249,7 @@ function calcDayPillar23(std) {
     d = n.getUTCDate();
   }
   const jdn = julianDayNumber(y, m, d);
-  const idx = mod(jdn + 47, 60); // Magic基準合わせ
+  const idx = mod(jdn + 49, 60); // Magic基準合わせ
   return sexagenaryFromIndex(idx);
 }
 
