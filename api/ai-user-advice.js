@@ -1,62 +1,57 @@
+// ===== /api/ai-user-advice.js : Part 1/3 =====
 /**
- * Vercel Serverless Function (ESM)
- * /api/ai-user-advice
+ * Magic Wands 準拠「名刺（命式）固定」→ AI文章化
  *
- * ✅ 依頼者向け：一般人でもわかる長文（1000〜1200字）で丁寧に解説
- * - 入力: { result: < /api/shichusuimei のレスポンス丸ごと > }
- * - 出力: { ok:true, text:"..." }  ※Markdown
+ * ✅ 方針（重要）:
+ * - /api/shichusuimei の result を「正」として扱う（再計算しない）
+ * - 節入り秒・真太陽時・境界などの “計算” は一切しない
+ * - modeで文体を切替:
+ *   - client: 依頼者向け（やさしい/納得/1000〜1200字・Markdown）
+ *   - professional: 鑑定士向け（根拠/読み筋/箇条書き多め）
  *
- * ✅ 重要:
- * - package.json が "type":"module" のため ESM（export default）
- * - OpenAI: Responses APIを優先、失敗時Chat Completionsへフォールバック
- * - 例外は必ず {ok:false,error} で返す
+ * ✅ 入力:
+ *  POST { result: < /api/shichusuimei レスポンス丸ごと >, mode?, focus?, ping? }
  *
- * ✅ CORS強化:
- * - try の外で必ずCORSヘッダを付与
- * - OPTIONS（preflight）を最優先で200返却
- * - GETで疎通確認できる診断レスポンス追加
+ * ✅ 出力:
+ *  { ok:true, text:"(Markdown)", summary:{...} }
  *
- * ✅ 安定化（今回追加）:
- * - ping:true で OpenAI を呼ばず即返却（疎通確認）
- * - OpenAI 呼び出しにタイムアウトを入れて無限pendingを防止
+ * ✅ 安定化:
+ * - ping:true で OpenAIを呼ばず返す
+ * - タイムアウト付き（AbortController）
+ * - JSON出力のパース失敗時はフォールバック
  *
- * ✅ Safari対策（今回修正）:
- * - Access-Control-Allow-Origin を固定せず、Originに合わせて返す（or *）
- * - Allow-Headers に Accept を含める（preflight不一致対策）
+ * ✅ CORS:
+ * - Safari対策で Origin を見て返す（環境変数 ALLOWED_ORIGINS 対応）
  */
 
 export default async function handler(req, res) {
-  // ==============================
-  // ✅ CORS（Safari “Load failed” 対策）
-  // ==============================
+  // ------------------------------
+  // CORS
+  // ------------------------------
   const origin = req.headers?.origin || "";
+  const allowList = (process.env.ALLOWED_ORIGINS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
 
-  // 許可したいオリジン（必要なら追加）
-  const ALLOWED_ORIGINS = new Set([
-    "https://saw.anjyanen.com",
-    "https://www.saw.anjyanen.com",
-    "https://spikatsu.anjyanen.com",
-    "https://www.spikatsu.anjyanen.com",
-  ]);
-
-  // Originが取れないケースもあるので、その場合は * に逃がす
-  // ※ credentials: "include" を使う予定が無いなら * が一番安全
-  const allowOrigin = ALLOWED_ORIGINS.has(origin) ? origin : "*";
+  const allowOrigin =
+    !allowList.length ? (origin || "*") : (origin && allowList.includes(origin) ? origin : "");
 
   res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.setHeader("Access-Control-Allow-Origin", allowOrigin);
-  res.setHeader("Vary", "Origin"); // ✅ CDNsでOrigin別キャッシュ崩れ防止
+  if (allowOrigin) res.setHeader("Access-Control-Allow-Origin", allowOrigin);
+  else res.setHeader("Access-Control-Allow-Origin", "*"); // 基本は *（credentials使わない前提）
+  res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS,GET");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept");
+  // Safari preflightズレ対策で Accept も許可
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization");
   res.setHeader("Access-Control-Max-Age", "86400");
 
-  // ✅ Preflight（最優先）
   if (req.method === "OPTIONS") {
     res.statusCode = 200;
     return res.end(JSON.stringify({ ok: true }));
   }
 
-  // ✅ GETで疎通確認（ブラウザで開いてOKならデプロイ確認が可能）
+  // GET 疎通確認
   if (req.method === "GET") {
     res.statusCode = 200;
     return res.end(
@@ -66,7 +61,7 @@ export default async function handler(req, res) {
         deployed: true,
         time: new Date().toISOString(),
         originSeen: origin || null,
-        allowOrigin,
+        allowOrigin: allowOrigin || "*",
       })
     );
   }
@@ -77,38 +72,50 @@ export default async function handler(req, res) {
       return res.end(JSON.stringify({ ok: false, error: "Method Not Allowed" }));
     }
 
-    const body =
-      req.body && typeof req.body === "object" ? req.body : await readJsonBody(req);
+    const body = req.body && typeof req.body === "object" ? req.body : await readJsonBody(req);
 
-    // ✅ 追加：疎通確認用（OpenAIを呼ばず即返し）
+    // ping: OpenAI呼ばない
     if (body?.ping === true) {
       res.statusCode = 200;
       return res.end(JSON.stringify({ ok: true, pong: true, time: new Date().toISOString() }));
     }
 
     const result = body?.result;
-    if (!result || typeof result !== "object") {
-      throw new Error("Invalid body: expected { result: {...} }");
-    }
-    if (!result.ok) {
-      throw new Error("Invalid result: result.ok is false");
-    }
+    if (!result || typeof result !== "object") throw new Error("Invalid body: expected { result: {...} }");
+    if (result.ok === false) throw new Error("Invalid result: result.ok is false");
+
+    const modeRaw = safeString(body?.mode).toLowerCase();
+    const mode = modeRaw === "professional" ? "professional" : "client";
+
+    const focusRaw = safeString(body?.focus).toLowerCase();
+    const focus = ["love", "work", "money", "life", "health"].includes(focusRaw) ? focusRaw : "life";
 
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) throw new Error("OPENAI_API_KEY is missing");
 
-    const model = process.env.OPENAI_MODEL_USER || process.env.OPENAI_MODEL || "gpt-4o-mini";
+    const model =
+      process.env.OPENAI_MODEL_USER ||
+      process.env.OPENAI_MODEL ||
+      "gpt-4o-mini";
+
     const temperature = clampNumber(process.env.OPENAI_TEMPERATURE_USER, 0.7, 0, 1.5);
 
-    const prompt = buildUserAdvicePrompt(result);
+    // 「名刺（命式）」前提のデータ要約（※再計算禁止）
+    const payload = buildFixedMeishikiPayload(result);
 
-    const text = await callOpenAIText({ apiKey, model, temperature, prompt });
+    const prompt = buildAdvicePrompt({ payload, mode, focus });
 
-    // 軽い整形（改行の暴れ防止）
+    const outText = await callOpenAIText({ apiKey, model, temperature, prompt });
+
+    // 期待：JSON { text, summary } だが崩れることもあるので保険
+    const parsed = safeJsonParse(outText);
+    const text = (parsed && typeof parsed.text === "string") ? parsed.text : String(outText || "");
+    const summary = (parsed && parsed.summary && typeof parsed.summary === "object") ? parsed.summary : {};
+
     const finalText = String(text).replace(/\n{3,}/g, "\n\n").trim();
 
     res.statusCode = 200;
-    return res.end(JSON.stringify({ ok: true, text: finalText }));
+    return res.end(JSON.stringify({ ok: true, text: finalText, summary }));
   } catch (e) {
     res.statusCode = 200;
     return res.end(JSON.stringify({ ok: false, error: String(e?.message || e) }));
@@ -134,119 +141,241 @@ function readJsonBody(req) {
   });
 }
 
+function safeString(v) {
+  return typeof v === "string" ? v.trim() : "";
+}
+
 function clampNumber(v, fallback, min, max) {
   const n = typeof v === "string" ? Number(v) : typeof v === "number" ? v : NaN;
   if (!Number.isFinite(n)) return fallback;
   return Math.min(max, Math.max(min, n));
 }
 
+function safeJsonParse(s) {
+  try {
+    if (typeof s !== "string") return null;
+    const t = s.trim();
+
+    // そのままJSON
+    if (t.startsWith("{") && t.endsWith("}")) return JSON.parse(t);
+
+    // ```json ... ``` 形式
+    const m = t.match(/```json\s*([\s\S]*?)\s*```/i);
+    if (m && m[1]) return JSON.parse(m[1].trim());
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 // ------------------------------
-// Prompt builder（依頼者向け）
+// 名刺（命式）固定：必要情報だけ抜き出す
 // ------------------------------
-function buildUserAdvicePrompt(result) {
-  const inp = result.input || {};
+function buildFixedMeishikiPayload(result) {
+  const input = result.input || {};
   const meta = result.meta || {};
+  const std = meta.standard || {};
   const used = meta.used || {};
   const pillars = result.pillars || {};
   const derived = result.derived || {};
 
-  // 依頼者向けは「鑑定データ」を“読み解き用に要約したJSON”を渡す（内部表示はしない）
-  const data = {
-    input: {
-      date: inp.date,
-      time: inp.time || "",
-      sex: inp.sex || "",
-      pref: meta?.place?.pref || inp?.birthPlace?.pref || "",
-      timeMode: inp.timeMode,
-      dayBoundaryMode: inp.dayBoundaryMode,
-    },
-    pillars: {
-      year: simplifyPillar(pillars.year),
-      month: simplifyPillar(pillars.month),
-      day: simplifyPillar(pillars.day),
-      hour: simplifyPillar(pillars.hour),
-    },
-    derived: {
-      fiveElements: derived.fiveElements || null,
-      tenDeity: derived.tenDeity || null,
-      luck: derived.luck || null,
-    },
-    hints: {
-      // 通変星の“翻訳”の土台（AIにブレなく説明させる）
-      tenDeityGlossary: {
-        "比肩": "自分を強く持つ・自立心が高まる",
-        "劫財": "仲間意識が強まり、人との関わりが増える（競争も）",
-        "食神": "気持ちに余裕が出て楽しみが増える・育てる力",
-        "傷官": "感受性が鋭くなり、変化を求める・表現力が増す",
-        "偏財": "ご縁が広がる・チャンスが外から入る",
-        "正財": "堅実さ・積み上げ・生活とお金の整え",
-        "偏官": "勢い・決断・挑戦が増える（無理は禁物）",
-        "正官": "責任・信頼・評価が高まりやすい",
-        "偏印": "ひらめき・独自性・方向転換が起きやすい",
-        "印綬": "学び・回復・支援が得られやすい",
-      },
-      fiveElementsNote:
-        "五行（木火土金水）は『性質のバランス』。多すぎる/少なすぎる要素があると、得意と苦手がハッキリ出る。",
-    },
-    // 境界メタはUIに出さないが、文章品質のため“境界の存在”だけはAIに渡す
-    boundary: {
-      yearBoundaryName: used?.yearBoundary?.name || null,
-      yearBoundaryTime: used?.yearBoundary?.timeJstSec || used?.yearBoundary?.timeJst || null,
-      monthBoundaryName: used?.monthBoundary?.name || null,
-      monthBoundaryTime: used?.monthBoundary?.timeJstSec || used?.monthBoundary?.timeJst || null,
-      note:
-        "節入り（年=立春/月=節）付近は性質が混ざりやすく、気質や運の出方が揺れやすい傾向がある。",
+  // 派生が未統合の旧結果でも落ちないように
+  const tenDeity = derived.tenDeity || null;
+  const fiveElements = derived.fiveElements || null;
+  const luck = derived.luck || null;
+
+  // 最低限の名刺（柱）
+  const meishiki = {
+    year: simplifyPillar(pillars.year),
+    month: simplifyPillar(pillars.month),
+    day: simplifyPillar(pillars.day),
+    hour: simplifyPillar(pillars.hour),
+  };
+
+  // 付加情報（ある分だけ）
+  const extras = {
+    tenDeity,
+    fiveElements,
+    luck: simplifyLuck(luck),
+    note: {
+      // 「再計算禁止」をAIに強制するための宣言
+      policy: "This meishiki is fixed. Do not recalculate pillars/boundaries/astronomy. Interpret only.",
     },
   };
 
-  const prompt = `
-# 役割
-あなたは一流の四柱推命鑑定師兼、心理カウンセラーです。
-専門用語の羅列である「鑑定データ」を読み解き、占いに詳しくない一般ユーザーが深く納得し、前向きになれるような【詳細な解説文】を作成してください。
-
-# 鑑定データ（入力）
-以下のJSONを読み取り、必要な情報を整理して文章化してください（JSONは出力に貼らないこと）。
-${JSON.stringify(data, null, 2)}
-
-# 執筆ルール
-1. **専門用語の翻訳**:
-   - 「比肩」を「自分を強く持つ時期」など、日常的な言葉に置き換えて説明してください。
-   - 上の tenDeityGlossary を“必ず基準”として使い、ブレない説明にしてください。
-2. **構成**: 以下の4セクションで構成してください（見出しは固定）。
-   - 【あなたの本質と性格】: 宿命が示す本来の自分
-   - 【現在の運気の流れ】: 今、どのような時期にいるのか
-   - 【仕事と人間関係の傾向】: 周囲との関わり方の注意点やアドバイス
-   - 【開運のアクション】: 具体的に何をすべきか（五行バランスを根拠に）
-3. **トーン**:
-   - 奏加たかお様が提唱する「スピ活ひろば」の精神に基づき、優しく、かつ論理的で信頼感のある丁寧語。
-4. **文量**:
-   - 各項目300文字程度、トータル1,000〜1,200文字程度の長文で詳しく解説してください。
-5. **重要**:
-   - JSONや内部仕様（API、Phase、実装用語、キー名）は出力しないこと。
-   - “節入り境界”は、必要な場合だけ自然な一文として触れてよい（例：節の切り替わり付近は性質が混ざりやすい、など）。
-
-# 出力形式
-Markdown形式で出力してください。
-`.trim();
-
-  return prompt;
+  return {
+    input: {
+      date: input.date || `${std.y || ""}-${std.m || ""}-${std.d || ""}`,
+      time: input.time || used.time || std.time || "",
+      sex: input.sex || "",
+      pref: input.birthPlace?.pref || "",
+    },
+    meta: {
+      standard: { y: std.y, m: std.m, d: std.d, time: std.time || "" },
+      used: { y: used.y, m: used.m, d: used.d, time: used.time || "" },
+      monthBoundary: used.monthBoundary || null,
+      yearPillarYearUsed: used.yearPillarYearUsed ?? null,
+    },
+    meishiki,
+    extras,
+  };
 }
 
 function simplifyPillar(p) {
-  if (!p) return null;
+  if (!p || typeof p !== "object") return null;
   const kan = p.kan?.text ?? p.kan ?? "";
   const shi = p.shi?.text ?? p.shi ?? "";
   return { kan, shi };
 }
 
+function simplifyLuck(luck) {
+  if (!luck || typeof luck !== "object") return null;
+  const out = {
+    direction: luck.direction || null,
+    startAgeYears: luck.startAgeYears ?? null,
+    startAgeDetail: luck.startAgeDetail || null,
+    current: luck.current || null,
+    dayun: Array.isArray(luck.dayun) ? luck.dayun.slice(0, 10) : null,
+    nenun: Array.isArray(luck.nenun) ? luck.nenun.slice(0, 13) : null,
+    currentDayun: luck.currentDayun || null,
+    currentNenun: luck.currentNenun || null,
+  };
+  return out;
+}
+// ===== /api/ai-user-advice.js : Part 2/3 =====
+// ------------------------------
+// Prompt builder（mode切替）
+// ------------------------------
+function buildAdvicePrompt({ payload, mode, focus }) {
+  // mode別の指示
+  const modeRule =
+    mode === "professional"
+      ? `
+# 出力スタイル（professional）
+- 対象：四柱推命の鑑定士（実務で使える読み筋）
+- 専門語は出してよい（ただし過剰な羅列は避ける）
+- 「根拠→読み→注意点→使い方」の順で短く鋭く
+- 最後に「依頼者へ伝える言い換え例」を3つ付ける（短文）
+- 文字量：800〜1400字程度（多少前後OK）
+`
+      : `
+# 出力スタイル（client）
+- 対象：占い初心者（依頼者向け）
+- 専門語の羅列はしない（出すなら必ず日常語に翻訳）
+- トーン：優しく、安心感があり、論理的で信頼できる丁寧語
+- 文字量：合計1000〜1200字（目安）
+- 構成は必ず4セクション（見出し固定）
+  - 【あなたの本質と性格】
+  - 【現在の運気の流れ】
+  - 【仕事と人間関係の傾向】
+  - 【開運のアクション】
+`;
+
+  const focusRule = `
+# focus（重視テーマ）
+- focus="${focus}"
+- life: 全体バランス
+- love: 恋愛/復縁/パートナー
+- work: 仕事/適職/対人
+- money: 金運/収支/習慣
+- health: メンタル/体調/休み方
+※ただし「命式の読み」を歪めず、焦点を当てるだけにする
+`.trim();
+
+  // “名刺固定” を強制
+  const hardRules = `
+# 絶対ルール（重要）
+1) 以下のJSONは「名刺（命式）」として正しい前提。**再計算・推測で柱を変えない。**
+2) 節入り秒・真太陽時・境界などの話はしない（計算や実装に触れない）。
+3) 出力にJSONやAPI用語、キー名は貼らない。
+4) 出力は **JSON形式** で返す（text, summary）。
+   - text: Markdown（本文）
+   - summary: object（短い要約。依頼者に見せてもOKな表現）
+`.trim();
+
+  // 十神翻訳の固定（依頼者向けのブレ防止）
+  const tenDeityGlossary = {
+    "比肩": "自分を強く持つ・自立心が高まる",
+    "劫財": "仲間意識が強まり、人との関わりが増える（競争も）",
+    "食神": "気持ちに余裕が出て楽しみが増える・育てる力",
+    "傷官": "感受性が鋭くなり、変化を求める・表現力が増す",
+    "偏財": "ご縁が広がる・チャンスが外から入る",
+    "正財": "堅実さ・積み上げ・生活とお金の整え",
+    "偏官": "勢い・決断・挑戦が増える（無理は禁物）",
+    "正官": "責任・信頼・評価が高まりやすい",
+    "七殺": "プレッシャーと突破力（急ぎすぎ注意）",
+    "偏印": "ひらめき・独自性・方向転換が起きやすい",
+    "印綬": "学び・回復・支援が得られやすい",
+  };
+
+  const dataForAI = {
+    // AIに渡すのは「名刺の要点」だけ（再計算しない）
+    ...payload,
+    glossary: { tenDeity: tenDeityGlossary },
+  };
+
+  // clientは4セクション固定。professionalは自由だが見出し推奨。
+  const sectionRule =
+    mode === "professional"
+      ? `
+# 構成（professional推奨）
+- 見出し例：
+  1. 命式の核（格・日主の状態・五行）
+  2. 読み筋（強み/課題）
+  3. 運（大運/歳運の使い方）
+  4. 注意点（やりがちミス）
+  5. 依頼者へ伝える言い換え例（3つ）
+`
+      : `
+# 構成（client固定）
+必ず次の見出し4つを、この順で使うこと（見出し文言は変更禁止）：
+- 【あなたの本質と性格】
+- 【現在の運気の流れ】
+- 【仕事と人間関係の傾向】
+- 【開運のアクション】
+`;
+
+  const prompt = `
+# 役割
+あなたは一流の四柱推命鑑定師であり、文章化のプロです。
+「名刺（命式）」をもとに、読み解きとアドバイスを作ります。
+
+${hardRules}
+
+${modeRule}
+
+${focusRule}
+
+${sectionRule}
+
+# 名刺（命式）データ（入力）
+以下のJSONを読み取り、解釈してください（出力に貼らない）。
+${JSON.stringify(dataForAI, null, 2)}
+
+# 出力JSONフォーマット（厳守）
+{
+  "text": "Markdown本文（改行OK）",
+  "summary": {
+    "core": "命式の核を1文",
+    "strength": "強みを1文",
+    "care": "注意点を1文",
+    "action": "今日からの行動を1文"
+  }
+}
+`.trim();
+
+  return prompt;
+}
+// ===== /api/ai-user-advice.js : Part 3/3 =====
 // ------------------------------
 // OpenAI caller (Responses -> fallback Chat Completions)
 //   ✅ タイムアウト付き（無限pending防止）
 // ------------------------------
 async function callOpenAIText({ apiKey, model, temperature, prompt }) {
-  const TIMEOUT_MS = 25000; // 長文なら 35000 でもOK
+  const TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS || 25000);
 
-  // 1) Responses API（タイムアウト付き）
+  // 1) Responses API
   try {
     const controller = new AbortController();
     const t = setTimeout(() => controller.abort(), TIMEOUT_MS);
@@ -272,7 +401,7 @@ async function callOpenAIText({ apiKey, model, temperature, prompt }) {
       const txt =
         (typeof j?.output_text === "string" && j.output_text) ||
         extractTextFromResponses(j);
-      if (txt) return txt.trim();
+      if (txt) return String(txt).trim();
     } else {
       const errTxt = await r.text().catch(() => "");
       throw new Error(`Responses API HTTP ${r.status} ${errTxt}`.slice(0, 300));
@@ -281,7 +410,7 @@ async function callOpenAIText({ apiKey, model, temperature, prompt }) {
     // fallbackへ
   }
 
-  // 2) Chat Completions fallback（タイムアウト付き）
+  // 2) Chat Completions fallback
   const controller2 = new AbortController();
   const t2 = setTimeout(() => controller2.abort(), TIMEOUT_MS);
 
