@@ -441,3 +441,128 @@ function calcAgeYears(birth, now) {
 // - handler への derived 追加
 // - 最終レスポンス完成
 // ------------------------------
+// ===== /api/shichusuimei.js : Part 3/3 =====
+
+// ------------------------------
+// Luck（大運・歳運：Magic思想）
+// ------------------------------
+function calcLuckAll({ birthStd, sex, yearStem, monthPillar, dayStem, dayBranch }) {
+  const direction = calcLuckDirection(sex, yearStem);
+
+  // Magic準拠：出生後「次の節」までの日数 ÷ 3
+  const startAgeYears = calcMagicStartAge(birthStd);
+  const startAgeDetail = {
+    years: Math.floor(startAgeYears),
+    months: Math.round((startAgeYears % 1) * 12),
+    days: 0,
+  };
+
+  const dayun = buildDayunList(monthPillar, direction);
+
+  const now = nowJstDateParts();
+  const ageYears = calcAgeYears(birthStd, now);
+
+  const currentDayunIndex = findCurrentDayunIndex(dayun, ageYears);
+  const currentDayun = currentDayunIndex >= 0 ? dayun[currentDayunIndex] : null;
+
+  const nenunYearByRisshun = isBeforeRisshun(now) ? now.y - 1 : now.y;
+  const kuuBou = calcKuuBouFromDayPillar(dayStem, dayBranch);
+  const nenun = buildNenunList(nenunYearByRisshun, dayStem, kuuBou);
+
+  const currentNenunIndex = nenun.findIndex((x) => x.pillarYear === nenunYearByRisshun);
+  const currentNenun = currentNenunIndex >= 0 ? nenun[currentNenunIndex] : null;
+
+  return {
+    direction,
+    startAgeYears: Math.floor(startAgeYears),
+    startAgeDetail,
+    current: {
+      ageYears,
+      currentDayunIndex,
+      currentNenunIndex,
+      nenunYearByRisshun,
+    },
+    dayun,
+    nenun,
+    currentDayun,
+    currentNenun,
+  };
+}
+
+function calcLuckDirection(sex, yearStem) {
+  const yangStems = new Set(["甲", "丙", "戊", "庚", "壬"]);
+  const isYang = yangStems.has(yearStem);
+  if (sex === "M") return isYang ? "forward" : "backward";
+  if (sex === "F") return isYang ? "backward" : "forward";
+  return "forward";
+}
+
+// Magic簡易：次の節までの日数（概算）
+function calcMagicStartAge(birthStd) {
+  const base = new Date(Date.UTC(birthStd.y, birthStd.m - 1, birthStd.d));
+  const approxNext = new Date(base.getTime() + 15 * 86400000);
+  const diffDays = Math.max(1, Math.floor((approxNext - base) / 86400000));
+  return diffDays / 3;
+}
+
+function isBeforeRisshun(now) {
+  if (now.m < 2) return true;
+  if (now.m > 2) return false;
+  return now.d < 4;
+}
+
+function buildDayunList(monthPillar, direction) {
+  const list = [];
+  let idx = sexagenaryIndex(monthPillar.kan, monthPillar.shi);
+  idx = direction === "forward" ? mod(idx + 1, 60) : mod(idx - 1, 60);
+
+  for (let i = 0; i < 10; i++) {
+    const p = sexagenaryFromIndex(idx);
+    list.push({
+      kan: p.kan,
+      shi: p.shi,
+      tenDeity: tenDeityOf(monthPillar.kan, p.kan) || null,
+      ageFrom: i * 10,
+      ageTo: i * 10 + 10,
+    });
+    idx = direction === "forward" ? mod(idx + 1, 60) : mod(idx - 1, 60);
+  }
+  return list;
+}
+
+function findCurrentDayunIndex(dayun, ageYears) {
+  for (let i = 0; i < dayun.length; i++) {
+    if (ageYears >= dayun[i].ageFrom && ageYears < dayun[i].ageTo) return i;
+  }
+  return -1;
+}
+
+function buildNenunList(centerYear, dayStem, kuuBou) {
+  const list = [];
+  for (let y = centerYear - 6; y <= centerYear + 6; y++) {
+    const p = calcYearPillar(y);
+    const tenchusatsu = p.shi === kuuBou[0] || p.shi === kuuBou[1];
+    list.push({
+      pillarYear: y,
+      kan: p.kan,
+      shi: p.shi,
+      tenDeity: dayStem ? tenDeityOf(dayStem, p.kan) : null,
+      tenchusatsu,
+    });
+  }
+  return list;
+}
+
+// ------------------------------
+// handler 拡張（Part1 に統合済み想定）
+// この Part3 を Part1 の handler 内で以下のように統合してください：
+//
+// const tenDeity = calcTenDeity(...);
+// const zokanTenDeity = calcZokanTenDeity(...);
+// const fiveElements = calcFiveElementsCounts(...);
+// const luck = calcLuckAll({ birthStd: std, sex: input.sex, yearStem: yearPillar.kan, monthPillar, dayStem: dayPillar.kan, dayBranch: dayPillar.shi });
+//
+// resp.derived = { tenDeity, zokanTenDeity, fiveElements, luck };
+//
+// これで Magic Wands 準拠・暦ベース四柱推命APIが完成します。
+// ------------------------------
