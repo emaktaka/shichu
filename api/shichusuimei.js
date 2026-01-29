@@ -301,8 +301,7 @@ function getMonthBoundaryByDate(std) {
   let best = null;
 
   for (const b of MONTH_BOUNDARIES) {
-
-    // ✅ 重要：小寒(1/6)は「1月の時だけ」判定対象にする
+    // ✅ 修正2：小寒(1/6)は「1月のときだけ」評価する
     if (b.m === 1 && std.m !== 1) continue;
 
     const before =
@@ -311,11 +310,16 @@ function getMonthBoundaryByDate(std) {
     if (before) best = b;
   }
 
-  // 1月で 1/6 より前なら「前年の大雪(12/7)」扱い
-  if (!best) best = MONTH_BOUNDARIES.find(x => x.m === 12) || MONTH_BOUNDARIES[MONTH_BOUNDARIES.length - 1];
+  // ✅ 1月で 1/6より前なら、前年の大雪(12/7)扱い
+  if (!best) {
+    best =
+      MONTH_BOUNDARIES.find((x) => x.m === 12) ||
+      MONTH_BOUNDARIES[MONTH_BOUNDARIES.length - 1];
+  }
 
   return best;
 }
+
 
 
 function calcMonthPillarFromBoundary(boundary, yearStem) {
