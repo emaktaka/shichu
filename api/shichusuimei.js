@@ -295,3 +295,149 @@ function getZokan(branch) {
   };
   return Z[branch] ? [...Z[branch]] : [];
 }
+// ===== /api/shichusuimei.js : Part 2/3 =====
+
+// ------------------------------
+// Ten Deity（通変星）
+// ------------------------------
+const STEM_INFO = {
+  "甲": { elem: "wood", yin: false },
+  "乙": { elem: "wood", yin: true },
+  "丙": { elem: "fire", yin: false },
+  "丁": { elem: "fire", yin: true },
+  "戊": { elem: "earth", yin: false },
+  "己": { elem: "earth", yin: true },
+  "庚": { elem: "metal", yin: false },
+  "辛": { elem: "metal", yin: true },
+  "壬": { elem: "water", yin: false },
+  "癸": { elem: "water", yin: true },
+};
+
+function elementRelation(dayElem, otherElem) {
+  if (dayElem === otherElem) return "same";
+  const gen = { wood: "fire", fire: "earth", earth: "metal", metal: "water", water: "wood" };
+  const ctl = { wood: "earth", earth: "water", water: "fire", fire: "metal", metal: "wood" };
+
+  if (gen[dayElem] === otherElem) return "day_creates_other";
+  if (gen[otherElem] === dayElem) return "other_creates_day";
+  if (ctl[dayElem] === otherElem) return "day_controls_other";
+  if (ctl[otherElem] === dayElem) return "other_controls_day";
+  return "none";
+}
+
+function tenDeityOf(dayStem, otherStem) {
+  if (!otherStem) return null;
+  const d = STEM_INFO[dayStem];
+  const o = STEM_INFO[otherStem];
+  if (!d || !o) return null;
+
+  const sameYY = d.yin === o.yin;
+  const rel = elementRelation(d.elem, o.elem);
+
+  if (rel === "same") return sameYY ? "比肩" : "劫財";
+  if (rel === "day_creates_other") return sameYY ? "食神" : "傷官";
+  if (rel === "other_creates_day") return sameYY ? "印綬" : "偏印";
+  if (rel === "day_controls_other") return sameYY ? "正財" : "偏財";
+  if (rel === "other_controls_day") return sameYY ? "正官" : "七殺";
+  return null;
+}
+
+function calcTenDeity(yearStem, monthStem, dayStem, hourStem) {
+  return {
+    year: tenDeityOf(dayStem, yearStem),
+    month: tenDeityOf(dayStem, monthStem),
+    day: "日主",
+    hour: hourStem ? tenDeityOf(dayStem, hourStem) : null,
+  };
+}
+
+function calcZokanTenDeity(yearBranch, monthBranch, dayBranch, hourBranch, dayStem) {
+  const conv = (br) => getZokan(br).map((s) => ({ stem: s, deity: tenDeityOf(dayStem, s) }));
+  return {
+    year: conv(yearBranch),
+    month: conv(monthBranch),
+    day: conv(dayBranch),
+    hour: hourBranch ? conv(hourBranch) : [],
+  };
+}
+
+// ------------------------------
+// Five Elements（五行バランス）
+// ------------------------------
+function calcFiveElementsCounts(stems, branches) {
+  const counts = { wood: 0, fire: 0, earth: 0, metal: 0, water: 0 };
+
+  for (const s of stems) {
+    const info = STEM_INFO[s];
+    if (info) counts[info.elem] += 1;
+  }
+  for (const b of branches) {
+    for (const z of getZokan(b)) {
+      const info = STEM_INFO[z];
+      if (info) counts[info.elem] += 1;
+    }
+  }
+
+  return {
+    counts,
+    note: "Counted from stems and hidden stems.",
+  };
+}
+
+// ------------------------------
+// 空亡（天中殺）
+// ------------------------------
+function sexagenaryIndex(kan, shi) {
+  for (let i = 0; i < 60; i++) {
+    const p = sexagenaryFromIndex(i);
+    if (p.kan === kan && p.shi === shi) return i;
+  }
+  return 0;
+}
+
+function calcKuuBouFromDayPillar(dayStem, dayBranch) {
+  const idx = sexagenaryIndex(dayStem, dayBranch);
+  const junStart = idx - (idx % 10);
+  const startBranch = BRANCHES[junStart % 12];
+  const startBi = BRANCHES.indexOf(startBranch);
+  const v1 = BRANCHES[mod(startBi - 2, 12)];
+  const v2 = BRANCHES[mod(startBi - 1, 12)];
+  return [v1, v2];
+}
+
+// ------------------------------
+// 現在日時（JST）
+// ------------------------------
+function nowJstDateParts() {
+  const now = new Date();
+  const jst = new Date(now.getTime() + 9 * 3600 * 1000);
+  return {
+    y: jst.getUTCFullYear(),
+    m: jst.getUTCMonth() + 1,
+    d: jst.getUTCDate(),
+    hh: jst.getUTCHours(),
+    mm: jst.getUTCMinutes(),
+    ss: jst.getUTCSeconds(),
+  };
+}
+
+function calcAgeYears(birth, now) {
+  const b = new Date(Date.UTC(birth.y, birth.m - 1, birth.d));
+  const n = new Date(Date.UTC(now.y, now.m - 1, now.d));
+  const diffDays = Math.floor((n.getTime() - b.getTime()) / 86400000);
+  return Math.floor(diffDays / 365.2425);
+}
+
+// ------------------------------
+// この Part2 では以下を追加しました：
+// - 通変星計算
+// - 蔵干通変星
+// - 五行カウント
+// - 空亡算出
+// - 年齢・現在時刻補助関数
+//
+// 次の Part 3 で：
+// - 大運・歳運（Magic思想）
+// - handler への derived 追加
+// - 最終レスポンス完成
+// ------------------------------
