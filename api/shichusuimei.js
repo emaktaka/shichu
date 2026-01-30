@@ -14,6 +14,9 @@
  * - 既存API互換のため input/meta/pillars/derived を返す
  */
 
+// ✅ デプロイ反映確認用（これが変わらないなら “別コードが動いてる”）
+const BUILD_ID = "fix2-2026-01-30-01";
+
 export default async function handler(req, res) {
   try {
     // ---- CORS / basics ----
@@ -27,7 +30,7 @@ export default async function handler(req, res) {
       return res.end(JSON.stringify({ ok: true }));
     }
 
-    // ✅ GET 疎通確認
+    // ✅ GET 疎通確認（buildId を必ず返す）
     if (req.method === "GET") {
       res.statusCode = 200;
       return res.end(
@@ -36,6 +39,7 @@ export default async function handler(req, res) {
           route: "/api/shichusuimei",
           deployed: true,
           mode: "magic_wands_calendar_fixed",
+          buildId: BUILD_ID, // ✅追加
           time: new Date().toISOString(),
         })
       );
@@ -128,6 +132,9 @@ export default async function handler(req, res) {
           m: std.m,
           d: std.d,
           time: formatHM(std.hh, std.mm),
+
+          // ✅ 反映確認用
+          buildId: BUILD_ID,
 
           yearPillarYearUsed: yearForPillar,
           monthBoundary: {
@@ -304,23 +311,17 @@ function getMonthBoundaryByDate(std) {
     // ✅ 修正2：小寒(1/6)は「1月のときだけ」評価する
     if (b.m === 1 && std.m !== 1) continue;
 
-    const before =
-      std.m > b.m || (std.m === b.m && std.d >= b.d);
-
+    const before = std.m > b.m || (std.m === b.m && std.d >= b.d);
     if (before) best = b;
   }
 
   // ✅ 1月で 1/6より前なら、前年の大雪(12/7)扱い
   if (!best) {
-    best =
-      MONTH_BOUNDARIES.find((x) => x.m === 12) ||
-      MONTH_BOUNDARIES[MONTH_BOUNDARIES.length - 1];
+    best = MONTH_BOUNDARIES.find((x) => x.m === 12) || MONTH_BOUNDARIES[MONTH_BOUNDARIES.length - 1];
   }
 
   return best;
 }
-
-
 
 function calcMonthPillarFromBoundary(boundary, yearStem) {
   const monthBranch = boundary.branch;
