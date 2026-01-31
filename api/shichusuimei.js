@@ -6,16 +6,13 @@
  * - 天文計算・秒単位節入りは使用しない（節入り“日”で固定）
  * - 年柱：立春「日」基準（2/4） ※時刻無視
  * - 月柱：節「日」基準（時刻無視 / Magic準拠）
- * - 日柱：23時切替固定（JST）
+ * - 日柱：24時切替固定（= 0:00で日替わり / JST）  ← ★B仕様
  * - 時柱：JSTそのまま
  * - 「命式は原則ズレない」思想に準拠
  *
  * 出力：
  * - 既存API互換のため input/meta/pillars/derived を返す
  */
-
-// ✅ デプロイ反映確認用（これが変わらないなら “別コードが動いてる”）
-const BUILD_ID = "fix2-2026-01-30-01";
 
 export default async function handler(req, res) {
   try {
@@ -30,7 +27,7 @@ export default async function handler(req, res) {
       return res.end(JSON.stringify({ ok: true }));
     }
 
-    // ✅ GET 疎通確認（buildId を必ず返す）
+    // ✅ GET 疎通確認
     if (req.method === "GET") {
       res.statusCode = 200;
       return res.end(
@@ -39,7 +36,7 @@ export default async function handler(req, res) {
           route: "/api/shichusuimei",
           deployed: true,
           mode: "magic_wands_calendar_fixed",
-          buildId: BUILD_ID, // ✅追加
+          buildId: "fixB-2026-02-01-01",
           time: new Date().toISOString(),
         })
       );
@@ -64,8 +61,8 @@ export default async function handler(req, res) {
     const monthBoundary = getMonthBoundaryByDate(std);
     const monthPillar = calcMonthPillarFromBoundary(monthBoundary, yearPillar.kan);
 
-    // --- 日柱（23時切替固定） ---
-    const dayPillar = calcDayPillar23(std);
+    // --- 日柱（24時切替固定 = 0:00で日替わり） ---
+    const dayPillar = calcDayPillar24(std);
 
     // --- 時柱（入力時刻がある時のみ） ---
     const hourPillar = input.time ? calcHourPillar(std, dayPillar.kan) : null;
@@ -114,7 +111,7 @@ export default async function handler(req, res) {
 
         // ✅ 互換用（フロントが参照しても破綻しない固定値）
         timeMode: "standard",
-        dayBoundaryMode: "23",
+        dayBoundaryMode: "24", // ★B仕様：0:00切替
         boundaryTimeRef: "standard",
         sekkiBoundaryPrecision: "day",
         sekkiBoundaryTieBreak: "after",
@@ -132,9 +129,6 @@ export default async function handler(req, res) {
           m: std.m,
           d: std.d,
           time: formatHM(std.hh, std.mm),
-
-          // ✅ 反映確認用
-          buildId: BUILD_ID,
 
           yearPillarYearUsed: yearForPillar,
           monthBoundary: {
@@ -159,7 +153,7 @@ export default async function handler(req, res) {
       pillars: {
         year: { ...yearPillar, zokan: getZokan(yearPillar.shi), rule: "magic_risshun_date" },
         month: { ...monthPillar, zokan: getZokan(monthPillar.shi), rule: "magic_jie_date" },
-        day: { ...dayPillar, zokan: getZokan(dayPillar.shi), rule: "day_boundary_23_fixed" },
+        day: { ...dayPillar, zokan: getZokan(dayPillar.shi), rule: "day_boundary_24_fixed" }, // ★
         hour: hourPillar
           ? { ...hourPillar, zokan: getZokan(hourPillar.shi), rule: "hour_jst" }
           : null,
@@ -350,29 +344,19 @@ function monthStemFromYearStem(yearStem, monthBranch) {
 }
 
 // ------------------------------
-// Day / Hour (23時切替)
+// Day (24時切替 = 0:00日替わり / JST)
 // ------------------------------
-function calcDayPillar23(std) {
-  let y = std.y,
-    m = std.m,
-    d = std.d;
-
-  if (std.hh >= 23) {
-    const dt = new Date(Date.UTC(y, m - 1, d));
-    const n = new Date(dt.getTime() + 86400000);
-    y = n.getUTCFullYear();
-    m = n.getUTCMonth() + 1;
-    d = n.getUTCDate();
-  }
-
-  const jdn = julianDayNumber(y, m, d);
-  const idx = mod(jdn + 49, 60); // ✅ Magic基準合わせ（あなたの検証値に合わせる）
+function calcDayPillar24(std) {
+  // 0:00で日替わりなので日付補正は不要
+  const jdn = julianDayNumber(std.y, std.m, std.d);
+  const idx = mod(jdn + 49, 60); // ✅ Magic基準合わせ（あなたの検証値）
   return sexagenaryFromIndex(idx);
 }
 
 function calcHourPillar(std, dayStem) {
   const t = std.hh * 60 + std.mm;
   let idx;
+  // 子刻(23:00-00:59) は idx=0 を維持（Magic表示と合わせやすい）
   if (t >= 23 * 60) idx = 0;
   else idx = Math.floor((t + 60) / 120);
 
