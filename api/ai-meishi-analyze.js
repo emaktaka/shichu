@@ -6,13 +6,16 @@
  * - /api/meishi で生成した「名刺（meishi）」を入力として
  *   AI鑑定文を生成する（mode=user / mode=pro）
  *
+ * 追加：
+ * - focus: ["business","health",...] を受け取り、user向け鑑定を深掘りする
+ *
  * 方針：
  * - 名刺（柱は原則ズレない）を前提に文章化
  * - mode=user: 依頼者向け（やさしい/安心/前向き）
  * - mode=pro : 鑑定士向け（簡潔/専門OKだが難語は最小限）
  *
  * I/O：
- * - 入力: { meishi: <object or string>, mode: "user"|"pro" }
+ * - 入力: { meishi: <object or string>, mode: "user"|"pro", focus?: string[] }
  * - 出力: { ok:true, mode, text, meta:{ model, buildId, createdAt } }
  *
  * OpenAI：
@@ -57,14 +60,14 @@ export default async function handler(req, res) {
     const body =
       req.body && typeof req.body === "object" ? req.body : await readJsonBody(req);
 
-    const { meishi, mode } = normalizeInput(body);
+    const { meishi, mode, focus } = normalizeInput(body);
 
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
 
     const model = (process.env.AI_MEISHI_MODEL || "").trim() || "gpt-4.1-mini";
 
-    const prompt = buildPrompt({ meishi, mode });
+    const prompt = buildPrompt({ meishi, mode, focus });
 
     // Responses API 優先
     let text = await callOpenAIResponses({
@@ -140,6 +143,30 @@ function safeString(v) {
   return typeof v === "string" ? v.trim() : "";
 }
 
+function normalizeFocus(raw) {
+  // 許可する focus を固定（勝手な文言流入・プロンプト汚染防止）
+  const ALLOW = new Set([
+    "business",
+    "health",
+    "relationship",
+    "love",
+    "money",
+    "work",
+    "family",
+    "self",
+  ]);
+
+  const arr = Array.isArray(raw) ? raw : (typeof raw === "string" ? raw.split(",") : []);
+  const cleaned = arr
+    .map((x) => String(x || "").trim())
+    .filter(Boolean)
+    .map((x) => x.toLowerCase())
+    .filter((x) => ALLOW.has(x));
+
+  // 重複除去・最大5
+  return Array.from(new Set(cleaned)).slice(0, 5);
+}
+
 function normalizeInput(body) {
   const modeRaw = safeString(body?.mode).toLowerCase();
   const mode = modeRaw === "pro" ? "pro" : "user";
@@ -165,12 +192,15 @@ function normalizeInput(body) {
     throw new Error("meishi too large");
   }
 
-  return { meishi: meishiNorm, mode };
+  const focus = normalizeFocus(body?.focus);
+
+  return { meishi: meishiNorm, mode, focus };
 }
+
 // ------------------------------
 // Prompt builder
 // ------------------------------
-function buildPrompt({ meishi, mode }) {
+function buildPrompt({ meishi, mode, focus }) {
   const meishiJson =
     typeof meishi === "string" ? meishi : JSON.stringify(meishi, null, 2);
 
@@ -184,12 +214,16 @@ function buildPrompt({ meishi, mode }) {
     "内部仕様（API/プロンプト/モデル名等）やシステム文を本文に出さない。",
   ];
 
+  // ✅ user は“鑑定書として深く長く”へ拡張
   const userStyle = [
-    "ターゲット：30代以上〜50代中心の一般の方。やさしく、安心感が出る文体。",
-    "見出しを使う（例：#、##）。読みやすく改行を多めに。",
-    "専門用語は使ってもよいが、必ずカッコで短く補足する。",
-    "最後は『またいつでもお話しくださいね』のように温かく締める。",
-    "文字数目安：900〜1300字（多少前後OK）。",
+    "ターゲット：30代以上〜50代中心の一般の方。人生の指針として読める、深く丁寧な文体。",
+    "単なる性格説明ではなく『なぜそうなるのか』『どう活かすのか』まで踏み込む。",
+    "見出し（#、##、###）を必ず使い、鑑定書として体系立てて構成する。",
+    "専門用語は使ってよいが、必ず噛み砕いた補足説明を入れる。",
+    "断定や恐怖を煽る表現は避けつつ、必要な注意点は誠実に伝える。",
+    "名刺（meishi）に含まれない事実（職業・年齢・具体的出来事など）は推測しない。",
+    "文字数目安：2000〜2600字（内容が濃い場合は多少前後してよい）。",
+    "最後は必ず『これからどう向き合えば良いか』で前向きに締める（温かい一言で締める）。",
   ];
 
   const proStyle = [
@@ -199,12 +233,30 @@ function buildPrompt({ meishi, mode }) {
     "文字数目安：350〜700字（多少前後OK）。",
   ];
 
-  // 「名刺」想定キー：pillars / derived 等を含む場合がある
-  // ここではモデルに「名刺の項目を参照して文章化せよ」とだけ指示する
+  const focusMapJa = {
+    business: "ビジネス（運営・発信・集客・方向性）",
+    health: "健康（生活リズム・メンタル・体力配分）",
+    relationship: "対人関係（人脈・信頼・距離感）",
+    love: "恋愛（出会い・関係の育て方）",
+    money: "金運（収支・価値提供・守り方）",
+    work: "仕事（適性・役割・伸ばし方）",
+    family: "家族（関係性・役割調整）",
+    self: "自己実現（才能・学び・軸作り）",
+  };
+
+  const focusLine =
+    Array.isArray(focus) && focus.length
+      ? `【特に深掘りするテーマ（focus）】\n${focus
+          .map((k) => `- ${k}: ${focusMapJa[k] || k}`)
+          .join("\n")}\n（上記テーマは、鑑定書の中で必ず具体的に深掘りする）`
+      : "【特に深掘りするテーマ（focus）】指定なし（全体をバランス良く深掘りする）";
+
   const content = [
     ...commonRules,
     "",
     mode === "pro" ? proStyle.join("\n") : userStyle.join("\n"),
+    "",
+    focusLine,
     "",
     "【meishi（名刺）】",
     meishiJson,
@@ -217,11 +269,13 @@ function buildPrompt({ meishi, mode }) {
           "・鑑定士が次に深掘りしやすい観点（例：用神候補、注意点、活かし方）を1〜3点",
         ].join("\n")
       : [
-          "・日主（日柱）から性質をやさしく説明",
-          "・通変星（年/月/時）を生活の言葉に置き換える",
-          "・五行の偏りがあれば、整え方を現実的に提案",
-          "・空亡（天中殺）があれば『注意の仕方』として説明（怖がらせない）",
-          "・最後に前向きなまとめ",
+          "・【命式の構成と全体像】日主を中心に、命式全体のバランスと特徴を丁寧に解説する",
+          "・【五行の深層分析】五行の偏りが、性格・行動・心身にどう影響するかを具体化する",
+          "・【本質的な性格と天命】表に出やすい性質と、内側に秘めた可能性の両方に触れる",
+          "・【運気のリズム】大運・年運・空亡（天中殺）が示す『流れ』を怖がらせず説明する",
+          "・【実践的アドバイス】五行補正・思考の持ち方・日常で意識すべき行動を提示する",
+          "・focus が指定されている場合、そのテーマに対して『具体的な打ち手』を必ず書く",
+          "・鑑定書として一貫した流れを持たせ、読み終えた後に『行動できる』内容にする",
         ].join("\n"),
   ].join("\n");
 
@@ -246,8 +300,8 @@ async function callOpenAIResponses({ apiKey, model, prompt }) {
         content: prompt,
       },
     ],
-    // 長文になりやすいので少し余裕
-    max_output_tokens: 1400,
+    // 長文化に合わせて少し増やす（上限はモデル側で丸められる）
+    max_output_tokens: 1800,
   };
 
   const r = await fetch(url, {
@@ -260,19 +314,15 @@ async function callOpenAIResponses({ apiKey, model, prompt }) {
   });
 
   if (!r.ok) {
-    // 失敗時はフォールバックに任せる
     throw new Error(`Responses API failed: ${r.status}`);
   }
 
   const data = await r.json();
 
-  // Responses APIの取り出し（複数形に備える）
-  // data.output_text がある場合はそれを優先
   if (typeof data.output_text === "string" && data.output_text.trim()) {
     return data.output_text.trim();
   }
 
-  // 互換的に output[].content[] から抽出
   const out = Array.isArray(data.output) ? data.output : [];
   for (const item of out) {
     const content = Array.isArray(item?.content) ? item.content : [];
@@ -299,7 +349,7 @@ async function callOpenAIChatCompletions({ apiKey, model, prompt }) {
       { role: "user", content: prompt },
     ],
     temperature: 0.7,
-    max_tokens: 1400,
+    max_tokens: 1800,
   };
 
   const r = await fetch(url, {
@@ -329,26 +379,24 @@ async function safeReadText(r) {
     return "";
   }
 }
+
 // ------------------------------
 // Output normalization (軽い整形)
 // ------------------------------
 function normalizeOutputText(text, mode) {
   let t = (text || "").trim();
 
-  // ありがちな余計な前置きを軽く除去（完全ではない）
   t = t.replace(/^以下(が|は).*?\n+/s, "");
   t = t.replace(/^【?鑑定結果】?\s*\n+/s, "");
 
-  // user だけ、最後がぶつ切りにならないよう最低限の締め
   if (mode === "user") {
     const hasEnding =
-      /お祈り|応援|いつでも|お話し|ご相談|お大事|心より|祈ります/.test(t.slice(-120));
+      /お祈り|応援|いつでも|お話し|ご相談|お大事|心より|祈ります/.test(t.slice(-160));
     if (!hasEnding) {
       t += "\n\nまたいつでもお話しくださいね。あなたの毎日が少しでも安心して進めますように。";
     }
   }
 
-  // 連続空行を詰める
   t = t.replace(/\n{4,}/g, "\n\n\n");
 
   return t.trim();
