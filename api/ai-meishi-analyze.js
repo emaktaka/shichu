@@ -233,6 +233,14 @@ function buildPrompt({ meishi, mode, focus }) {
   const meishiJson =
     typeof meishi === "string" ? meishi : JSON.stringify(meishi, null, 2);
 
+  // ✅ フリガナ指示（依頼者向けのみ強制）
+  const furiganaRulesUser = [
+    "【重要：読みやすさ】四柱推命の専門用語は、初出だけ必ずフリガナ（読み）を丸括弧で付ける。",
+    "例：日主（にっしゅ）／月令（げつれい）／通変星（つうへんせい）／蔵干（ぞうかん）／十二運（じゅうにうん）／空亡（くうぼう）／天中殺（てんちゅうさつ）／大運（たいうん）／年運（ねんうん）／用神（ようじん）／忌神（きしん）／印綬（いんじゅ）／偏印（へんいん）／比肩（ひけん）／劫財（ごうざい）／食神（しょくしん）／傷官（しょうかん）／偏財（へんざい）／正財（せいざい）／偏官（へんかん）／正官（せいかん）／偏官＝七殺（しちさつ）／正官（せいかん）",
+    "同じ用語を繰り返すたびにフリガナは不要（初出のみ）。",
+    "漢字が難しい概念は、短い言い換えを添える（例：『用神＝バランスを整える助け役』のように1行）。",
+  ];
+
   const commonRules = [
     "あなたは四柱推命の鑑定文ライターです。",
     "入力の meishi（名刺）だけを根拠にして文章を作ります。推測で出生地や家族構成などを作らない。",
@@ -289,6 +297,8 @@ function buildPrompt({ meishi, mode, focus }) {
     ...commonRules,
     "",
     mode === "pro" ? proStyle.join("\n") : userStyle.join("\n"),
+    "",
+    ...(mode === "pro" ? [] : furiganaRulesUser),
     "",
     focusLine,
     "",
